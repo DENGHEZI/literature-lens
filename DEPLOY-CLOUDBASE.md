@@ -91,24 +91,48 @@ curl http://127.0.0.1:8877/api/health
 
 ---
 
-## 五、小程序侧切换（改一个值）
+## 五、小程序侧切换（两种接入方式）
 
-编辑 `文献透镜小程序-源码/literature-lens-mp/common/config.js`：
+> ⚠ **关键官方事实**：云托管的「默认公网域名」**不能**在微信公众平台「服务器域名」里配置
+> （官方《微信云托管开发常识》明确：小程序后台无法配置使用默认公网域名；默认公网域名性能受限，仅限测试）。
+> 因此想用 `uni.request` + 公网域名上线，**必须**有你自己的、**已完成 ICP 备案**的自定义域名。
+> 若不想买域名/等备案，请走下面的 **方式二 callContainer**（微信私有协议，免域名、免备案）。
 
+### 方式一 · 自有备案域名（uni.request，代码改动最小）
+编辑 `common/config.js`，仅改 `BASE_URL`：
 ```js
-// 生产环境：改成云托管给的公网 HTTPS 域名（去掉末尾斜杠）
-export const BASE_URL = 'https://literature-lens-xxxx.ap-shanghai.run.tcloudbase.com'
+export const BASE_URL = 'https://你的备案域名'   // 如 https://lens.example.com
+// USE_CLOUD 保持 false
 ```
+然后**重编译**小程序 → 导入微信开发者工具。并在
+[微信公众平台](https://mp.weixin.qq.com) → 开发管理 → 开发设置 → 服务器域名 加白名单：
+- **request 合法域名** / **uploadFile 合法域名** / **downloadFile 合法域名** 都加上你的域名。
 
-然后**重编译**小程序（HBuilderX CLI `compile_ai.py`）→ 导入微信开发者工具。
+### 方式二 · 云托管 callContainer（免域名、免备案，推荐）
+编辑 `common/config.js`：
+```js
+export const USE_CLOUD     = true                        // 开启后所有 /api/* 走 wx.cloud.callContainer
+export const CLOUD_ENV     = 'prod-d1gfs45gs080943ba'    // 云托管环境 ID
+export const CLOUD_SERVICE = 'literature-lens'           // 部署后端后获得的服务名（不是 express-w5t5 示例）
+```
+`App.vue` 已在 `onLaunch` 里按 `USE_CLOUD` 自动 `wx.cloud.init`，无需手动调用。
+重编译小程序即可。**无需配服务器域名、无需 ICP。**
 
-### 微信公众平台加白名单（必须）
-登录 [微信公众平台](https://mp.weixin.qq.com) → 开发管理 → 开发设置 → 服务器域名：
-- **request 合法域名**：加 `YOUR_DOMAIN`
-- **uploadFile 合法域名**：加 `YOUR_DOMAIN`（上传 PDF 用）
-- **downloadFile 合法域名**：加 `YOUR_DOMAIN`（页图本地落盘前仍可加，保险）
+### callContainer 的三条硬限制（决定后端还要改什么）
+1. **单次请求 ≤ 15s**：翻译/对话/导图/深度讲解等 6 个大模型接口目前是同步等 LLM 返回，
+   很容易超 15s → 后端须改成「提交即回任务号 + 轮询」模式（参照已有的 `/api/analyze-pdf`）。
+2. **请求体 ≤ 100K、body 不带图片**：`/api/upload-pdf` 当前用 multipart 直传 PDF（必超 100K）
+   → 改走**对象存储**：小程序 `wx.cloud.uploadFile` 拿 `fileID` → `callContainer` 把 `fileID`
+   交给后端 → 后端用微信「获取文件下载地址」API 取回 PDF。客户端 `common/api.js` 的
+   `_cloudUploadPdf` 已按此实现，后端对应 handler 见下方「待办」。
+3. **页图**：`fetchPageImage` 已改为 callContainer(arraybuffer) 取回页图写本地，可用；
+   若运行时发现 callContainer 不返回二进制，则后端把页图存对象存储、返回临时 URL。
 
-> 真机调试时记得在开发者工具勾选「不校验合法域名…」可先跳过，但正式发布前必须配齐。
+### 后端待办（部署真实服务前需补齐）
+- [ ] 大模型接口（chat/translate/translate-page/deepen/mindmap）改为异步任务 + 轮询，≤15s 返回任务号。
+- [ ] `/api/upload-pdf` 支持 `{"fileID": ...}` 入参：用微信 API 取回对象存储里的 PDF 再解析。
+- [ ] （可选）页图走对象存储返回 URL，替代 callContainer 二进制回传。
+- [ ] 部署后把真实 `CLOUD_SERVICE` 名回填到 `common/config.js`。
 
 ---
 
