@@ -28,6 +28,7 @@ import time
 import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -638,6 +639,240 @@ def _reanalyze_worker(task_id, doc_id):
         set_task(status="error", stage="解析失败", error=msg)
 
 
+# ---------------- 微信云存储取文件（callContainer 下 PDF 走对象存储） ----------------
+_WX_TOKEN = {"token": "", "exp": 0}
+
+
+def _wx_get_access_token():
+    """用小程序 AppID + AppSecret 换 access_token（缓存到过期前 5 分钟）。
+
+    需在云托管服务环境变量配置：WX_APPID / WX_SECRET（以及 WX_ENV 云环境 ID）。
+    """
+    appid = (os.environ.get("WX_APPID") or "").strip()
+    secret = (os.environ.get("WX_SECRET") or "").strip()
+    if not (appid and secret):
+        raise RuntimeError("后端未配置 WX_APPID / WX_SECRET 环境变量，无法从云存储取回 PDF")
+    now = time.time()
+    if _WX_TOKEN["token"] and _WX_TOKEN["exp"] > now + 300:
+        return _WX_TOKEN["token"]
+    url = ("https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential"
+           f"&appid={urllib.parse.quote(appid)}&secret={urllib.parse.quote(secret)}")
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            d = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"获取微信 access_token 失败：{e}")
+    if "access_token" not in d:
+        raise RuntimeError("获取微信 access_token 失败：" + str(d))
+    _WX_TOKEN["token"] = d["access_token"]
+    _WX_TOKEN["exp"] = now + int(d.get("expires_in", 7200))
+    return _WX_TOKEN["token"]
+
+
+def _wx_file_download_url(fileid, env=None):
+    """把云存储 fileID 换成临时下载地址（batchdownloadfile）。"""
+    tok = _wx_get_access_token()
+    env = (env or os.environ.get("WX_ENV") or "").strip()
+    if not env:
+        raise RuntimeError("缺少云环境 ID（环境变量 WX_ENV）")
+    url = "https://api.weixin.qq.com/tcb/batchdownloadfile?access_token=" + tok
+    data = json.dumps({"env": env, "fileid_list": [fileid]}).encode("utf-8")
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"获取文件下载地址失败：{e}")
+    if d.get("errcode") or not d.get("download_list"):
+        raise RuntimeError("获取文件下载地址失败：" + str(d))
+    return d["download_list"][0]["download_url"]
+
+
+# ---------------- 大模型请求统一处理（同步 / 异步复用） ----------------
+_LLM_STAGE = {
+    "translate": "正在翻译…",
+    "translate_page": "正在整页翻译…",
+    "chat": "AI 思考中…",
+    "mindmap": "正在生成思维导图…",
+    "deepen": "正在生成深度讲解…",
+}
+
+
+def _llm_translate(text, mode, with_confidence=False):
+    """带落盘缓存的翻译，返回 (result_dict, error_str)。"""
+    translation, cached, err = _translate_text(text, mode)
+    if err:
+        return None, err
+    confidence = None
+    if with_confidence:
+        try:
+            confidence = translation_confidence(
+                text, translation, STATE["cfg"].get("egress"),
+                timeout=(STATE["cfg"].get("egress") or {}).get("search_timeout", 10))
+        except Exception:
+            confidence = None
+    return {"translation": translation, "mode": mode,
+            "cached": cached, "confidence": confidence}, None
+
+
+def _handle_llm_action(action, req):
+    """统一执行各类大模型请求，返回 (result_dict, error_str)。
+
+    供同步端点（uni.request 模式）与异步任务端点（callContainer ≤15s 模式）共用。
+    两种接入方式结果一致；error 非 None 时 result 为 None。
+    """
+    llm = STATE["llm"]
+    if not llm or not getattr(llm, "providers", None):
+        return None, ("后端未配置 AI 模型。请在网页「设置→API」粘贴 Key，"
+                      "或在小程序「我的」里自行配置各端 API。")
+    req = req or {}
+    if action == "translate":
+        text = (req.get("text") or "").strip()[:4000]
+        if not text:
+            return None, "text 为空"
+        return _llm_translate(text, (req.get("mode") or "general").lower(),
+                              bool(req.get("with_confidence")))
+    if action == "translate_page":
+        doc_id = str(req.get("doc") or "")
+        try:
+            page = int(req.get("page") or 0)
+        except (TypeError, ValueError):
+            page = 0
+        doc = STATE["doc_index"].get(doc_id)
+        if doc is None or page < 1:
+            return None, "doc 或 page 参数无效"
+        text = ""
+        if (doc.get("meta") or {}).get("source_key") == "upload":
+            pdf = _resolve_upload_pdf(doc)
+            if pdf:
+                text = _page_text_from_pdf(pdf, page)
+        if not text:
+            pt = doc.get("pages_txt") or {}
+            text = pt.get(str(page)) or pt.get(page) or ""
+        text = (text or "").strip()
+        if not text:
+            return None, f"第 {page} 页没有可提取的文本（扫描版 PDF 或超出页码范围）"
+        chars = len(text)
+        r, err = _llm_translate(text, "academic", bool(req.get("with_confidence")))
+        if err:
+            return None, err
+        r["page"] = page
+        r["chars"] = chars
+        return r, None
+    if action == "chat":
+        doc = STATE["doc_index"].get(req.get("doc_id"))
+        if not doc:
+            return None, "请先从左侧选择一篇文献"
+        messages = req.get("messages") or []
+        if not isinstance(messages, list) or not messages:
+            return None, "messages 不能为空"
+        trimmed = []
+        for m in messages[-8:]:
+            if not isinstance(m, dict):
+                continue
+            role = (m.get("role") or "").strip().lower()
+            if role not in ("user", "assistant", "system"):
+                continue
+            content = str(m.get("content") or "").strip()[:2000]
+            if content:
+                trimmed.append({"role": role, "content": content})
+        if not trimmed:
+            return None, "没有有效消息"
+        last_user = ""
+        for m in reversed(trimmed):
+            if m["role"] == "user":
+                last_user = m["content"]
+                break
+        ctx = _relevant_ctx(doc, last_user or (trimmed[-1]["content"] if trimmed else ""))
+        profile = doc.get("profile") or {}
+        profile_text = json.dumps({
+            "title_zh": profile.get("title_zh", ""),
+            "research_question": profile.get("research_question", ""),
+            "method": profile.get("method", ""),
+            "findings": profile.get("findings", []),
+            "keywords": profile.get("keywords", []),
+        }, ensure_ascii=False)
+        field = (req.get("field") or "").strip()
+        field_line = (f"\n【提问者研究方向】{field}\n"
+                      "对方可能是该领域的科研工作者，请用其熟悉的专业语言作答。"
+                      if field else "")
+        ptr = req.get("pointer") or {}
+        ptr_line = ""
+        if isinstance(ptr, dict) and ptr.get("page"):
+            ptr_line = (f"\n【阅读指针】用户正在阅读原文第 {ptr.get('page')} 页，"
+                        "回答时优先结合该页的内容与图表。")
+        ctx_block = ("【文献标题】" + (doc["meta"].get("title") or "") + "\n"
+                     "【文献画像】" + profile_text[:1500] + "\n"
+                     "【正文片段（已按问题相关性筛选）】\n"
+                     + ctx[:10000] + field_line + ptr_line)
+        system_prompt = ("你是文献透镜的 AI 科研助手，擅长根据当前论文回答用户的问题。"
+                         "回答必须基于以下文献语境；无法确认时明确写「原文未提及」，绝不编造。"
+                         "回复简洁有层次，优先用中文，长度控制在 600 字以内。\n\n" + ctx_block)
+        history = [{"role": "system", "content": system_prompt}] + trimmed
+        try:
+            reply = llm.chat(history[-1]["content"], system=system_prompt,
+                             temperature=0.25, max_tokens=1500)
+        except LLMError as e:
+            return None, f"{e}"[:220]
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"[:200]
+        if not reply:
+            return None, "模型未返回有效内容"
+        pinfo = llm.provider()
+        return {"reply": str(reply).strip(), "model": pinfo.get("name", ""),
+                "usage_est": {
+                    "in_chars": sum(len(m["content"]) for m in trimmed) + len(system_prompt),
+                    "out_chars": len(reply.strip())}}, None
+    if action == "mindmap":
+        question = (req.get("question") or "").strip()
+        doc = STATE["doc_index"].get(req.get("doc_id"))
+        if not question:
+            return None, "请先输入想理解的问题"
+        if not doc:
+            return None, "请先从左侧选择一篇文献"
+        ctx = _relevant_ctx(doc, question)
+        result = STATE["az"].question_map(question, ctx, doc.get("profile") or {})
+        if not result:
+            return None, "导图生成失败；请检查用户提供的推理 API 或稍后重试"
+        pinfo = llm.pick_for("mindmap") or llm.provider()
+        return {"mindmap": result, "model": pinfo.get("name") or pinfo.get("id", "")}, None
+    if action == "deepen":
+        doc = STATE["doc_index"].get(req.get("doc_id"))
+        cid = req.get("concept_id")
+        if not doc:
+            return None, "文献不存在"
+        concept = next((c for c in doc.get("concepts", []) if c["id"] == cid), None)
+        if not concept:
+            return None, "知识点不存在"
+        ctx = "\n\n".join(b["source"] for b in doc.get("bilingual", [])[:40])
+        try:
+            d = STATE["az"].deepen(concept, ctx)
+        except LLMError as e:
+            return None, f"{e}"[:220]
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"[:200]
+        if not d:
+            return None, "模型未返回有效内容"
+        return {"detail": d, "model": llm.provider()["name"]}, None
+    return None, f"未知 action：{action}"
+
+
+def _llm_worker(task_id, action, req):
+    """后台跑大模型请求，结果写入 TASKS（callContainer ≤15s 异步化）。"""
+    def set_task(**kw):
+        _set_task(task_id, **kw)
+    try:
+        set_task(status="running", stage=_LLM_STAGE.get(action, "AI 生成中…"))
+        result, err = _handle_llm_action(action, req)
+        if err:
+            set_task(status="error", stage="生成失败", error=err[:260])
+            return
+        set_task(status="done", stage="完成", **result)
+    except Exception as e:
+        set_task(status="error", stage="生成失败", error=f"{type(e).__name__}: {e}"[:260])
+
+
 class Handler(BaseHTTPRequestHandler):
     # HTTP/1.1 keep-alive：手机端连续翻页/请求复用 TCP 连接，明显加快响应
     protocol_version = "HTTP/1.1"
@@ -708,6 +943,40 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"ok": False, "error": "文件不是有效 PDF（缺少 %PDF- 文件头）"})
             return None
         safe_title = os.path.basename(file_name).replace("\x00", "") or "uploaded.pdf"
+        token = uuid.uuid4().hex
+        target = os.path.join(STATE["upload_dir"], token + ".pdf")
+        with open(target, "wb") as f:
+            f.write(pdf)
+        return {"id": token, "name": safe_title, "size": len(pdf), "created_at": int(time.time())}
+
+    def _read_pdf_upload_fileid(self, req):
+        """callContainer 模式：PDF 已先经小程序 wx.cloud.uploadFile 落到云存储，
+        这里拿 fileID 换临时下载地址并落盘到 upload_dir。"""
+        cfg = STATE["cfg"].get("uploads") or {}
+        max_bytes = int(cfg.get("max_mb", 40)) * 1024 * 1024
+        file_id = (req.get("fileID") or "").strip()
+        if not file_id:
+            self._send(400, {"ok": False, "error": "缺少 fileID（云存储上传后回传的文件 ID）"})
+            return None
+        try:
+            dl = _wx_file_download_url(file_id)
+        except RuntimeError as e:
+            self._send(200, {"ok": False, "error": str(e)[:220]})
+            return None
+        try:
+            with urllib.request.urlopen(dl, timeout=60) as r:
+                pdf = r.read()
+        except Exception as e:
+            self._send(200, {"ok": False, "error": f"从云存储下载 PDF 失败：{e}"[:220]})
+            return None
+        if len(pdf) > max_bytes:
+            self._send(413, {"ok": False, "error": f"PDF 大小需在 0-{cfg.get('max_mb', 40)}MB 内"})
+            return None
+        if not pdf.lstrip().startswith(b"%PDF-"):
+            self._send(400, {"ok": False, "error": "云存储文件不是有效 PDF（缺少 %PDF- 文件头）"})
+            return None
+        safe_title = os.path.basename((req.get("filename") or "uploaded.pdf")
+                                      .replace("\x00", "")) or "uploaded.pdf"
         token = uuid.uuid4().hex
         target = os.path.join(STATE["upload_dir"], token + ".pdf")
         with open(target, "wb") as f:
@@ -803,6 +1072,17 @@ class Handler(BaseHTTPRequestHandler):
                 t = dict(TASKS.get(tid) or {})
             if not t:
                 self._send(404, {"ok": False, "error": "未知解析任务"})
+                return
+            self._send(200, {"ok": True, **t})
+        elif p == "/api/task":
+            # 通用任务轮询：上传解析 / 大模型请求共用同一 TASKS 字典。
+            task = urlparse(self.path).query
+            m = re.search(r"(?:^|&)task=([\w-]+)", task)
+            tid = m.group(1) if m else ""
+            with _TASKS_LOCK:
+                t = dict(TASKS.get(tid) or {})
+            if not t:
+                self._send(404, {"ok": False, "error": "未知任务"})
                 return
             self._send(200, {"ok": True, **t})
         elif p == "/api/docs":
@@ -1039,10 +1319,37 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
         if p == "/api/upload-pdf":
-            meta = self._read_pdf_upload()
+            # 方式一（本地 / 自有域名）：multipart 直传。
+            # 方式二（callContainer）：JSON 带 fileID，后端从云存储取回。
+            ctype = (self.headers.get("Content-Type") or "").lower()
+            if "multipart/form-data" in ctype:
+                meta = self._read_pdf_upload()
+            else:
+                req = self._read_json()
+                if req is None:
+                    return
+                meta = self._read_pdf_upload_fileid(req)
             if meta:
                 meta["url"] = "/uploads/" + meta["id"] + ".pdf"
                 self._send(200, {"ok": True, "upload": meta})
+            return
+        if p == "/api/llm-task":
+            # callContainer 异步化入口：大模型请求立即返回 task_id，后台线程跑，
+            # 前端轮询 /api/task 取结果（规避 callContainer ≤15s 超时）。
+            # 同步（uni.request）模式同样可用，返回结构一致。
+            req = self._read_json()
+            if req is None:
+                return
+            action = (req.get("action") or "").strip().lower()
+            if action not in _LLM_STAGE:
+                self._send(400, {"ok": False, "error": f"未知的 AI 动作：{action}"})
+                return
+            task_id = uuid.uuid4().hex
+            _set_task(task_id, status="queued", stage=_LLM_STAGE.get(action, "排队中…"),
+                      action=action, created_at=int(time.time()))
+            threading.Thread(target=_llm_worker, args=(task_id, action, req.get("payload") or {}),
+                             daemon=True).start()
+            self._send(200, {"ok": True, "task": task_id})
             return
         if p == "/api/analyze-pdf":
             # 启动后台解析线程：上传 PDF → 抽取/翻译/创新点分析 → 写入文献库
