@@ -1,0 +1,76 @@
+{
+  "active_provider": "deepseek",
+  "note": "模型无关配置。换模型只需改 providers 里的 base_url/api_key/model，或再跑 python scripts/llm_models.py --add kimi。所有字段都有默认值，protocol 可省（按 base_url 自动识别）。api_key 支持 ${ENV_VAR} 写法。",
+
+  "providers": [
+    {
+      "id": "deepseek",
+      "name": "DeepSeek V4.1 Flash",
+      "protocol": "openai",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "${DEEPSEEK_API_KEY}",
+      "model": "deepseek-chat",
+      "enabled": true,
+      "weight": 10,
+      "roles": ["chat", "translate", "analyze", "mindmap"],
+      "ctx": 128000,
+      "max_output": 8192,
+      "supports_json": true
+    },
+    {
+      "id": "glm",
+      "name": "智谱 GLM-4.6V-Flash",
+      "protocol": "openai",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "api_key": "${GLM_API_KEY}",
+      "model": "GLM-4.6V-Flash",
+      "enabled": true,
+      "weight": 5,
+      "roles": ["chat", "translate", "analyze", "mindmap", "vision"],
+      "ctx": 128000,
+      "max_output": 8192,
+      "supports_json": true
+    }
+  ],
+
+  "roles": {
+    "translate": "翻译（长文分块，建议用便宜且长上下文的模型）",
+    "analyze": "创新点分析（要求 JSON 稳定、推理强，建议用旗舰模型）",
+    "mindmap": "问题理解与证据思维导图（建议用推理强且 JSON 稳定的用户 API）",
+    "chat": "通用兜底",
+    "vision": "图像理解（可选，用于图表解读）"
+  },
+
+  "fallback": {
+    "on_error_switch_provider": true,
+    "max_provider_tries": 2
+  },
+
+  "limits": {
+    "max_pages": 8,
+    "max_chars_body": 14000,
+    "max_tokens_analyze": 7000,
+    "max_tokens_terms": 1800
+  },
+
+  "sources": {
+    "liyu_raw": "D:/LiyuAgent/data/raw/鲤鱼科研",
+    "farmers_water": "D:/农户用水行为_文献库"
+  },
+
+  "output": {
+    "dir": "D:/LiteratureLens/outputs",
+    "site_name": "文献透镜 LiteratureLens"
+  },
+
+  "translate": {
+    "max_chars_per_block": 2600,
+    "keep_bilingual": true
+  },
+
+  "uploads": {
+    "dir": "D:/LiteratureLens/uploads",
+    "max_mb": 40,
+    "note": "网页上传的 PDF 仅保存到本机此目录，并通过浏览器内置 PDF 阅读器展示。"
+  }
+}

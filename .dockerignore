@@ -1,0 +1,30 @@
+# ---------------- 密钥 / 本地配置（绝不进镜像） ----------------
+config.user.json
+config.user.example.json
+config.json
+
+# ---------------- 运行时数据（云端走 /data 持久卷） ----------------
+data/
+uploads/
+downloads/
+outputs/
+
+# ---------------- 日志 / 本地启动器 / 一次性脚本 ----------------
+*.log
+serve.log
+serve_relaunch.log
+启动文献透镜.bat
+download_docker.py
+
+# ---------------- Python 缓存 ----------------
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# ---------------- 文档（不影响构建） ----------------
+*.docx
+SKILL.md
+DEPLOY-CLOUDBASE.md
+README*

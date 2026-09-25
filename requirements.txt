@@ -1,0 +1,4 @@
+# 文献透镜后端依赖（仅 3 个第三方，均带预编译 wheel，python:3.11-slim 可直接装）
+PyMuPDF        # import fitz —— PDF 渲染页图 + 词级坐标提取
+Pillow         # import PIL —— 页图缩放/编码
+pypdf          # import pypdf —— PDF 文本抽取

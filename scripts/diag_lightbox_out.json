@@ -1,0 +1,23 @@
+{
+  "before": {
+    "hasOrigPage": true,
+    "imgComplete": true,
+    "imgNaturalW": 765,
+    "lightboxOpenBefore": false,
+    "selText": "",
+    "lbSrcBefore": ""
+  },
+  "after": {
+    "lightboxOpenAfter": false,
+    "lbDisplay": "none",
+    "lbSrc": "",
+    "lbNaturalW": 0,
+    "selTextAfter": ""
+  },
+  "consoleErrors": [
+    "Failed to load resource: the server responded with a status of 404 (Not Found)"
+  ],
+  "probe": {
+    "directOpenWorks": true
+  }
+}

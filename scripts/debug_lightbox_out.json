@@ -1,0 +1,21 @@
+{
+  "setup": {
+    "hasMousedown": "undefined",
+    "onclickType": "object",
+    "lbCloseOnclick": "function"
+  },
+  "afterMicro": {
+    "open": false,
+    "openCalls": []
+  },
+  "directClose": {
+    "before": true,
+    "after": false,
+    "handlerType": "function"
+  },
+  "logs": [
+    "[verbose] [DOM] Password field is not contained in a form: (More info: https://www.chromium.org/developers/design-documents/create-amazing-password-forms) %o",
+    "[error] Failed to load resource: the server responded with a status of 404 (Not Found)",
+    "[info] Images loaded lazily and replaced with placeholders. Load events are deferred. See https://go.microsoft.com/fwlink/?linkid=2048113"
+  ]
+}

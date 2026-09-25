@@ -1,0 +1,22 @@
+# ---------------- 密钥（绝不入库） ----------------
+config.user.json
+
+# ---------------- 运行时数据 / 用户上传 ----------------
+data/
+uploads/
+downloads/
+outputs/
+
+# ---------------- 日志 / 本地启动器 ----------------
+*.log
+serve.log
+serve_relaunch.log
+启动文献透镜.bat
+download_docker.py
+
+# ---------------- Python ----------------
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
