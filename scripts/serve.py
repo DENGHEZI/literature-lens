@@ -521,7 +521,7 @@ def _set_task(task_id, **kw):
         TASKS.setdefault(task_id, {}).update(kw)
 
 
-def _analyze_worker(task_id, upload_id, filename):
+def _analyze_worker(task_id, upload_id, filename, llm_cfg=None):
     """后台解析上传的 PDF：抽取 → 术语 → 批量翻译 → 创新点分析 → 写入文献库。
 
     复用主流水线（pipeline.process_one），与离线批量分析产出同一套数据结构，
@@ -538,8 +538,20 @@ def _analyze_worker(task_id, upload_id, filename):
         set_task(status="running", stage="正在抽取正文与原页图…")
         rec = {"filename": filename, "path": pdf_path}
         llm = STATE["llm"]
-        tr = Translator(llm)
-        az = STATE["az"]
+        # 优先用前端（手机）随请求传来的临时 Key；否则回退后端已配置的 provider。
+        # => 云端后端无需任何 AI 配置，PDF 解析直接用用户手机上已配好的 Key。
+        if llm_cfg:
+            try:
+                llm = _build_temporary_llm(llm_cfg)
+            except Exception:
+                llm = STATE["llm"]
+        has_llm = bool(llm and getattr(llm, "providers", None))
+        tr = Translator(llm) if has_llm else None
+        az = Analyzer(llm) if has_llm else None
+        if not has_llm:
+            set_task(status="error", stage="解析失败",
+                     error="后端未配置 AI 模型且前端未提供 Key；请在「设置 → API」填写 Key")
+            return
         doc = process_one(rec, llm, tr, az, max_pages=8)
         doc["meta"]["source"] = "本地上传"
         doc["meta"]["source_key"] = "upload"
@@ -1369,9 +1381,11 @@ class Handler(BaseHTTPRequestHandler):
             _set_task(task_id, status="queued", stage="排队中…",
                       upload_id=upload_id, filename=filename,
                       created_at=int(time.time()))
+            # 允许前端（手机）随请求带来临时 LLM 配置（用手机已配的 Key），后端无需任何 AI 配置
+            llm_cfg = req.get("llm") or None
             threading.Thread(
                 target=_analyze_worker,
-                args=(task_id, upload_id, filename),
+                args=(task_id, upload_id, filename, llm_cfg),
                 daemon=True,
             ).start()
             self._send(200, {"ok": True, "task": task_id})
