@@ -962,18 +962,26 @@ class Handler(BaseHTTPRequestHandler):
         return {"id": token, "name": safe_title, "size": len(pdf), "created_at": int(time.time())}
 
     def _read_pdf_upload_fileid(self, req):
-        """callContainer 模式：PDF 已先经小程序 wx.cloud.uploadFile 落到云存储，
-        这里拿 fileID 换临时下载地址并落盘到 upload_dir。"""
+        """callContainer 模式：PDF 已先经小程序 wx.cloud.uploadFile 落到云存储。
+
+        主路径（免密钥）：小程序已用 getTempFileURL 换出临时直链 file_url，
+        后端直接下载落盘 —— 无需 WX_APPID/WX_SECRET/WX_ENV。
+        回退路径：只给了 fileID 时走 batchdownloadfile（需后端配齐 WX 环境变量）。
+        """
         cfg = STATE["cfg"].get("uploads") or {}
         max_bytes = int(cfg.get("max_mb", 40)) * 1024 * 1024
+        file_url = (req.get("file_url") or "").strip()
         file_id = (req.get("fileID") or "").strip()
-        if not file_id:
-            self._send(400, {"ok": False, "error": "缺少 fileID（云存储上传后回传的文件 ID）"})
-            return None
-        try:
-            dl = _wx_file_download_url(file_id)
-        except RuntimeError as e:
-            self._send(200, {"ok": False, "error": str(e)[:220]})
+        if file_url:
+            dl = file_url
+        elif file_id:
+            try:
+                dl = _wx_file_download_url(file_id)
+            except RuntimeError as e:
+                self._send(200, {"ok": False, "error": str(e)[:220]})
+                return None
+        else:
+            self._send(400, {"ok": False, "error": "缺少 file_url 或 fileID（云存储上传后回传）"})
             return None
         try:
             with urllib.request.urlopen(dl, timeout=60) as r:
