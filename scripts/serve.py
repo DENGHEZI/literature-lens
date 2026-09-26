@@ -656,15 +656,46 @@ def _reanalyze_worker(task_id, doc_id):
 _WX_TOKEN = {"token": "", "exp": 0}
 
 
+_WX_SECRET_FILE = None
+
+
+def _load_wx_secret_file():
+    """读取部署目录下的 wx_secret.json（{"WX_APPID":..,"WX_SECRET":..,"WX_ENV":..}）。
+
+    作用：把 WX 密钥直接打进部署包，免去在云托管控制台手填环境变量。
+    环境变量优先；该文件仅作兜底。文件不应提交到 git（.gitignore 已忽略）。
+    """
+    global _WX_SECRET_FILE
+    if _WX_SECRET_FILE is not None:
+        return _WX_SECRET_FILE
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "..", "wx_secret.json"),
+                 os.path.join(here, "wx_secret.json"),
+                 "wx_secret.json"):
+        try:
+            if cand and os.path.exists(cand):
+                with open(cand, "r", encoding="utf-8") as f:
+                    _WX_SECRET_FILE = json.load(f) or {}
+                return _WX_SECRET_FILE
+        except Exception:
+            continue
+    _WX_SECRET_FILE = {}
+    return _WX_SECRET_FILE
+
+
 def _wx_get_access_token():
     """用小程序 AppID + AppSecret 换 access_token（缓存到过期前 5 分钟）。
 
-    需在云托管服务环境变量配置：WX_APPID / WX_SECRET（以及 WX_ENV 云环境 ID）。
+    来源优先级：环境变量 WX_APPID/WX_SECRET > 部署包 wx_secret.json。
     """
     appid = (os.environ.get("WX_APPID") or "").strip()
     secret = (os.environ.get("WX_SECRET") or "").strip()
     if not (appid and secret):
-        raise RuntimeError("后端未配置 WX_APPID / WX_SECRET 环境变量，无法从云存储取回 PDF")
+        ws = _load_wx_secret_file() or {}
+        appid = appid or str(ws.get("WX_APPID") or "").strip()
+        secret = secret or str(ws.get("WX_SECRET") or "").strip()
+    if not (appid and secret):
+        raise RuntimeError("后端未配置 WX_APPID / WX_SECRET（环境变量或 wx_secret.json），无法从云存储取回 PDF")
     now = time.time()
     if _WX_TOKEN["token"] and _WX_TOKEN["exp"] > now + 300:
         return _WX_TOKEN["token"]
@@ -687,7 +718,9 @@ def _wx_file_download_url(fileid, env=None):
     tok = _wx_get_access_token()
     env = (env or os.environ.get("WX_ENV") or "").strip()
     if not env:
-        raise RuntimeError("缺少云环境 ID（环境变量 WX_ENV）")
+        env = str((_load_wx_secret_file() or {}).get("WX_ENV") or "").strip()
+    if not env:
+        raise RuntimeError("缺少云环境 ID（环境变量 WX_ENV 或 wx_secret.json）")
     url = "https://api.weixin.qq.com/tcb/batchdownloadfile?access_token=" + tok
     data = json.dumps({"env": env, "fileid_list": [fileid]}).encode("utf-8")
     req = urllib.request.Request(url, data=data,
