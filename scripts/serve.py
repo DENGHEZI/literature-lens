@@ -26,6 +26,7 @@ import webbrowser
 import re
 import time
 import uuid
+import base64
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 import urllib.request
@@ -962,43 +963,62 @@ class Handler(BaseHTTPRequestHandler):
         return {"id": token, "name": safe_title, "size": len(pdf), "created_at": int(time.time())}
 
     def _read_pdf_upload_fileid(self, req):
-        """callContainer 模式：PDF 已先经小程序 wx.cloud.uploadFile 落到云存储。
+        """callContainer 模式：PDF 经小程序上传后回传标识，后端落盘。
 
-        主路径（免密钥）：小程序已用 getTempFileURL 换出临时直链 file_url，
-        后端直接下载落盘 —— 无需 WX_APPID/WX_SECRET/WX_ENV。
-        回退路径：只给了 fileID 时走 batchdownloadfile（需后端配齐 WX 环境变量）。
+        三种来源（按优先级，全部免密钥优先）：
+        1. file_data：小程序本地读成 base64 直传（★最稳，不碰云存储直链、不碰 WX 密钥、
+           不需要容器出网，典型论文 <15MB 直接可用）
+        2. file_url：小程序 getTempFileURL 换出的临时直链，后端下载（免 WX）
+        3. fileID：云存储 fileID，后端 batchdownloadfile 取回（需 WX_APPID/WX_SECRET/WX_ENV）
         """
         cfg = STATE["cfg"].get("uploads") or {}
         max_bytes = int(cfg.get("max_mb", 40)) * 1024 * 1024
+        file_data = (req.get("file_data") or "").strip()
         file_url = (req.get("file_url") or "").strip()
         file_id = (req.get("fileID") or "").strip()
-        if file_url:
-            dl = file_url
+
+        # 1) 直传 base64（最稳，免密钥）
+        if file_data:
+            try:
+                pdf = base64.b64decode(file_data)
+            except Exception as e:
+                self._send(400, {"ok": False, "error": f"file_data 不是合法 base64：{e}"[:220]})
+                return None
+        # 2) 临时直链下载（免 WX）
+        elif file_url:
+            try:
+                req_dl = urllib.request.Request(
+                    file_url,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; LiteratureLens/1.0)",
+                             "Referer": "https://servicewechat.com/"},
+                )
+                with urllib.request.urlopen(req_dl, timeout=60) as r:
+                    pdf = r.read()
+            except Exception as e:
+                self._send(200, {"ok": False, "error": f"从云存储下载 PDF 失败：{e}"[:220]})
+                return None
+        # 3) fileID 回退（需 WX 密钥）
         elif file_id:
             try:
                 dl = _wx_file_download_url(file_id)
             except RuntimeError as e:
                 self._send(200, {"ok": False, "error": str(e)[:220]})
                 return None
+            try:
+                with urllib.request.urlopen(dl, timeout=60) as r:
+                    pdf = r.read()
+            except Exception as e:
+                self._send(200, {"ok": False, "error": f"从云存储下载 PDF 失败：{e}"[:220]})
+                return None
         else:
-            self._send(400, {"ok": False, "error": "缺少 file_url 或 fileID（云存储上传后回传）"})
+            self._send(400, {"ok": False, "error": "缺少 file_data / file_url / fileID（PDF 上传后回传）"})
             return None
-        try:
-            req_dl = urllib.request.Request(
-                dl,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; LiteratureLens/1.0)",
-                         "Referer": "https://servicewechat.com/"},
-            )
-            with urllib.request.urlopen(req_dl, timeout=60) as r:
-                pdf = r.read()
-        except Exception as e:
-            self._send(200, {"ok": False, "error": f"从云存储下载 PDF 失败：{e}"[:220]})
-            return None
+
         if len(pdf) > max_bytes:
             self._send(413, {"ok": False, "error": f"PDF 大小需在 0-{cfg.get('max_mb', 40)}MB 内"})
             return None
         if not pdf.lstrip().startswith(b"%PDF-"):
-            self._send(400, {"ok": False, "error": "云存储文件不是有效 PDF（缺少 %PDF- 文件头）"})
+            self._send(400, {"ok": False, "error": "上传内容不是有效 PDF（缺少 %PDF- 文件头）"})
             return None
         safe_title = os.path.basename((req.get("filename") or "uploaded.pdf")
                                       .replace("\x00", "")) or "uploaded.pdf"
