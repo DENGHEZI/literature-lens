@@ -27,6 +27,7 @@ import re
 import time
 import uuid
 import base64
+import tempfile
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 import urllib.request
@@ -706,6 +707,25 @@ def _read_cloudbase_token():
     return None
 
 
+def _env_from_fileid(fileid):
+    """从云存储 fileID 自动解析环境 ID。
+
+    fileID 形如 cloud://<env-id>.<bucket-后缀>/<路径>，
+    例：cloud://prod-d1gfs45gs080943ba.7065-prod-xxx-1258717764/lens_uploads/a.pdf
+    → 环境ID = prod-d1gfs45gs080943ba。免去手配 WX_ENV 环境变量。
+    """
+    try:
+        s = (fileid or "").strip()
+        if s.lower().startswith("cloud://"):
+            first = s[8:].split("/", 1)[0]
+            env = first.split(".", 1)[0].strip()
+            if env:
+                return env
+    except Exception:
+        pass
+    return ""
+
+
 def _wx_secret_access_token():
     """仅用 AppID + AppSecret 换取 access_token；无配置时返回 None（不抛错）。"""
     appid = (os.environ.get("WX_APPID") or "").strip()
@@ -745,7 +765,10 @@ def _wx_file_download_url(fileid, env=None):
     if not env:
         env = str((_load_wx_secret_file() or {}).get("WX_ENV") or "").strip()
     if not env:
-        raise RuntimeError("缺少云环境 ID（环境变量 WX_ENV 或 wx_secret.json）")
+        # fileID 自带环境 ID（cloud://<env>.<bucket>/<path>），免配置直接解析
+        env = _env_from_fileid(fileid)
+    if not env:
+        raise RuntimeError("缺少云环境 ID（WX_ENV 未配置，且 fileID 无法解析出环境 ID）")
 
     body = json.dumps({"env": env, "file_list": [{"fileid": fileid, "max_age": 7200}]}).encode("utf-8")
 
@@ -1057,14 +1080,32 @@ class Handler(BaseHTTPRequestHandler):
             f.write(pdf)
         return {"id": token, "name": safe_title, "size": len(pdf), "created_at": int(time.time())}
 
+    def _save_pdf_bytes(self, pdf, filename):
+        """校验大小/PDF 文件头并落盘，返回 meta dict；不合法时已发送响应并返回 None。"""
+        cfg = STATE["cfg"].get("uploads") or {}
+        max_bytes = int(cfg.get("max_mb", 40)) * 1024 * 1024
+        if len(pdf) > max_bytes:
+            self._send(413, {"ok": False, "error": f"PDF 大小需在 0-{cfg.get('max_mb', 40)}MB 内"})
+            return None
+        if not pdf.lstrip().startswith(b"%PDF-"):
+            self._send(400, {"ok": False, "error": "上传内容不是有效 PDF（缺少 %PDF- 文件头）"})
+            return None
+        safe_title = os.path.basename(str(filename or "uploaded.pdf").replace("\x00", "")) or "uploaded.pdf"
+        token = uuid.uuid4().hex
+        target = os.path.join(STATE["upload_dir"], token + ".pdf")
+        with open(target, "wb") as f:
+            f.write(pdf)
+        return {"id": token, "name": safe_title, "size": len(pdf), "created_at": int(time.time())}
+
     def _read_pdf_upload_fileid(self, req):
         """callContainer 模式：PDF 经小程序上传后回传标识，后端落盘。
 
-        三种来源（按优先级，全部免密钥优先）：
-        1. file_data：小程序本地读成 base64 直传（★最稳，不碰云存储直链、不碰 WX 密钥、
-           不需要容器出网，典型论文 <15MB 直接可用）
+        来源（按优先级）：
+        1. file_data：base64 直传——仅公网/自有域名模式可用
+           （callContainer 官方限制请求体 ≤100KB，小程序端请走 /api/upload-pdf-chunk 分块）
         2. file_url：小程序 getTempFileURL 换出的临时直链，后端下载（免 WX）
-        3. fileID：云存储 fileID，后端 batchdownloadfile 取回（需 WX_APPID/WX_SECRET/WX_ENV）
+        3. fileID：云存储 fileID，后端 batchdownloadfile 取回
+           （凭证优先云托管自动令牌/开放接口服务，环境 ID 可从 fileID 自动解析）
         """
         cfg = STATE["cfg"].get("uploads") or {}
         max_bytes = int(cfg.get("max_mb", 40)) * 1024 * 1024
@@ -1092,7 +1133,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(200, {"ok": False, "error": f"从云存储下载 PDF 失败：{e}"[:220]})
                 return None
-        # 3) fileID 回退（需 WX 密钥）
+        # 3) fileID 回退（凭证走云托管令牌/开放接口服务/AppSecret）
         elif file_id:
             try:
                 dl = _wx_file_download_url(file_id)
@@ -1100,7 +1141,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": False, "error": str(e)[:220]})
                 return None
             try:
-                with urllib.request.urlopen(dl, timeout=60) as r:
+                req_dl = urllib.request.Request(
+                    dl,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; LiteratureLens/1.0)",
+                             "Referer": "https://servicewechat.com/"},
+                )
+                with urllib.request.urlopen(req_dl, timeout=30) as r:
                     pdf = r.read()
             except Exception as e:
                 self._send(200, {"ok": False, "error": f"从云存储下载 PDF 失败：{e}"[:220]})
@@ -1109,19 +1155,80 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"ok": False, "error": "缺少 file_data / file_url / fileID（PDF 上传后回传）"})
             return None
 
-        if len(pdf) > max_bytes:
+        return self._save_pdf_bytes(pdf, req.get("filename"))
+
+    # 分块直传缓冲：upload_id → 临时 base64 文件放系统临时目录，最后一块组装落盘
+    _CHUNK_ID_RE = re.compile(r"^[a-f0-9]{8,64}$")
+
+    def _read_pdf_chunk(self, req):
+        """callContainer 请求体 ≤100KB 的终极兜底：小程序把 PDF 切成 base64 块逐个直传，
+        最后一块组装落盘。完全不依赖云存储 / WX 密钥 / 对象存储签名。
+
+        请求：{upload_id, seq, total, data(base64片段), filename}
+              {upload_id, abort:true} 中止并清理
+        """
+        upload_id = (req.get("upload_id") or "").strip()
+        if not self._CHUNK_ID_RE.match(upload_id):
+            self._send(400, {"ok": False, "error": "upload_id 不合法（需 8-64 位十六进制）"})
+            return
+        tmp = os.path.join(tempfile.gettempdir(), "lens_chunk_" + upload_id + ".b64")
+        if req.get("abort"):
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            self._send(200, {"ok": True, "aborted": True})
+            return
+        cfg = STATE["cfg"].get("uploads") or {}
+        max_bytes = int(cfg.get("max_mb", 40)) * 1024 * 1024
+        try:
+            seq = int(req.get("seq") or 0)
+            total = int(req.get("total") or 0)
+        except Exception:
+            seq = total = 0
+        data = re.sub(r"\s+", "", str(req.get("data") or ""))
+        if total <= 0 or seq < 0 or seq >= total or not data:
+            self._send(400, {"ok": False, "error": "分块参数不合法（seq/total/data）"})
+            return
+        # 容量闸门：base64 膨胀约 4/3，累计上限 = max_bytes*4/3 + 余量
+        cur = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+        if cur + len(data) > int(max_bytes * 4 / 3) + 65536:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
             self._send(413, {"ok": False, "error": f"PDF 大小需在 0-{cfg.get('max_mb', 40)}MB 内"})
-            return None
-        if not pdf.lstrip().startswith(b"%PDF-"):
-            self._send(400, {"ok": False, "error": "上传内容不是有效 PDF（缺少 %PDF- 文件头）"})
-            return None
-        safe_title = os.path.basename((req.get("filename") or "uploaded.pdf")
-                                      .replace("\x00", "")) or "uploaded.pdf"
-        token = uuid.uuid4().hex
-        target = os.path.join(STATE["upload_dir"], token + ".pdf")
-        with open(target, "wb") as f:
-            f.write(pdf)
-        return {"id": token, "name": safe_title, "size": len(pdf), "created_at": int(time.time())}
+            return
+        try:
+            with open(tmp, "ab") as f:
+                f.write(data.encode("ascii"))
+        except Exception as e:
+            self._send(500, {"ok": False, "error": f"分块写入失败：{e}"[:200]})
+            return
+        if seq < total - 1:
+            self._send(200, {"ok": True, "received": seq + 1, "total": total})
+            return
+        # 最后一块：读取 → 组装 → 落盘（临时文件无论成败都删除）
+        try:
+            with open(tmp, "rb") as f:
+                b64 = f.read().decode("ascii")
+        except Exception as e:
+            self._send(500, {"ok": False, "error": f"分块读取失败：{e}"[:200]})
+            return
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        try:
+            pdf = base64.b64decode(b64)
+        except Exception as e:
+            self._send(400, {"ok": False, "error": f"base64 组装失败：{e}"[:200]})
+            return
+        meta = self._save_pdf_bytes(pdf, req.get("filename"))
+        if meta:
+            meta["url"] = "/uploads/" + meta["id"] + ".pdf"
+            self._send(200, {"ok": True, "upload": meta})
 
     def _llm_required(self):
         """未配置任何 AI 模型时，回 200 ok:False 并 return True（已处理）。
@@ -1473,6 +1580,14 @@ class Handler(BaseHTTPRequestHandler):
             if meta:
                 meta["url"] = "/uploads/" + meta["id"] + ".pdf"
                 self._send(200, {"ok": True, "upload": meta})
+            return
+        if p == "/api/upload-pdf-chunk":
+            # callContainer 请求体 ≤100KB 的分块直传：小程序把 PDF 切成 base64 块
+            # 逐个发送，最后一块组装落盘。零依赖（不碰云存储/WX 密钥），兜底最稳。
+            req = self._read_json(max_bytes=256 * 1024)
+            if req is None:
+                return
+            self._read_pdf_chunk(req)
             return
         if p == "/api/llm-task":
             # callContainer 异步化入口：大模型请求立即返回 task_id，后台线程跑，
