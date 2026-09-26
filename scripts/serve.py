@@ -683,11 +683,31 @@ def _load_wx_secret_file():
     return _WX_SECRET_FILE
 
 
-def _wx_get_access_token():
-    """用小程序 AppID + AppSecret 换 access_token（缓存到过期前 5 分钟）。
+def _read_cloudbase_token():
+    """微信云托管容器会自动把 access_token 推送到该只读挂载文件（约10分钟刷新，30分钟有效）。
 
-    来源优先级：环境变量 WX_APPID/WX_SECRET > 部署包 wx_secret.json。
+    存在说明运行在云托管环境，可免 AppSecret 调用开放接口（需控制台「微信令牌权限配置」添加对应接口路径）。
     """
+    candidates = (
+        "/.tencentcloudbase/wx/cloudbase_access_token",
+        os.path.join(os.environ.get("TENCENTCLOUD_RUNENV_BASE", ""), "wx/cloudbase_access_token"),
+    )
+    for p in candidates:
+        if not p:
+            continue
+        try:
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    t = (f.read() or "").strip()
+                if t:
+                    return t
+        except Exception:
+            continue
+    return None
+
+
+def _wx_secret_access_token():
+    """仅用 AppID + AppSecret 换取 access_token；无配置时返回 None（不抛错）。"""
     appid = (os.environ.get("WX_APPID") or "").strip()
     secret = (os.environ.get("WX_SECRET") or "").strip()
     if not (appid and secret):
@@ -695,7 +715,7 @@ def _wx_get_access_token():
         appid = appid or str(ws.get("WX_APPID") or "").strip()
         secret = secret or str(ws.get("WX_SECRET") or "").strip()
     if not (appid and secret):
-        raise RuntimeError("后端未配置 WX_APPID / WX_SECRET（环境变量或 wx_secret.json），无法从云存储取回 PDF")
+        return None
     now = time.time()
     if _WX_TOKEN["token"] and _WX_TOKEN["exp"] > now + 300:
         return _WX_TOKEN["token"]
@@ -704,35 +724,69 @@ def _wx_get_access_token():
     try:
         with urllib.request.urlopen(url, timeout=10) as r:
             d = json.loads(r.read().decode("utf-8"))
-    except Exception as e:
-        raise RuntimeError(f"获取微信 access_token 失败：{e}")
+    except Exception:
+        return None
     if "access_token" not in d:
-        raise RuntimeError("获取微信 access_token 失败：" + str(d))
+        return None
     _WX_TOKEN["token"] = d["access_token"]
     _WX_TOKEN["exp"] = now + int(d.get("expires_in", 7200))
     return _WX_TOKEN["token"]
 
 
 def _wx_file_download_url(fileid, env=None):
-    """把云存储 fileID 换成临时下载地址（batchdownloadfile）。"""
-    tok = _wx_get_access_token()
+    """把云存储 fileID 换成临时下载地址（tcb/batchdownloadfile）。
+
+    凭证优先级（免 AppSecret 优先）：
+      1) 云托管自动推送令牌 cloudbase_access_token（容器挂载文件，需控制台「微信令牌权限配置」添加 /tcb/batchdownloadfile）
+      2) 开放接口服务：不带 token 直接调用（同样需上面权限配置）
+      3) 小程序 AppSecret（环境变量 / wx_secret.json）
+    """
     env = (env or os.environ.get("WX_ENV") or "").strip()
     if not env:
         env = str((_load_wx_secret_file() or {}).get("WX_ENV") or "").strip()
     if not env:
         raise RuntimeError("缺少云环境 ID（环境变量 WX_ENV 或 wx_secret.json）")
-    url = "https://api.weixin.qq.com/tcb/batchdownloadfile?access_token=" + tok
-    data = json.dumps({"env": env, "fileid_list": [fileid]}).encode("utf-8")
-    req = urllib.request.Request(url, data=data,
-                                 headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            d = json.loads(r.read().decode("utf-8"))
-    except Exception as e:
-        raise RuntimeError(f"获取文件下载地址失败：{e}")
-    if d.get("errcode") or not d.get("download_list"):
-        raise RuntimeError("获取文件下载地址失败：" + str(d))
-    return d["download_list"][0]["download_url"]
+
+    body = json.dumps({"env": env, "file_list": [{"fileid": fileid, "max_age": 7200}]}).encode("utf-8")
+
+    attempts = []
+    cb = _read_cloudbase_token()
+    if cb:
+        attempts.append(("cloudbase_access_token", cb))
+    attempts.append((None, None))  # 开放接口服务：不带 token
+    sec = _wx_secret_access_token()
+    if sec:
+        attempts.append(("access_token", sec))
+
+    last_err = None
+    for param, token in attempts:
+        if param:
+            api = f"https://api.weixin.qq.com/tcb/batchdownloadfile?{param}=" + token
+        else:
+            api = "https://api.weixin.qq.com/tcb/batchdownloadfile"
+        req = urllib.request.Request(api, data=body,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                d = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            last_err = f"请求异常：{e}"
+            continue
+        if d.get("errcode"):
+            # 41001/40014 等表示此路不通，换下一种凭证
+            last_err = f"errcode={d.get('errcode')} {d.get('errmsg')}"
+            continue
+        lst = d.get("file_list") or d.get("download_list") or []
+        if not lst:
+            last_err = "返回文件列表为空：" + str(d)
+            continue
+        item = lst[0] or {}
+        dl = item.get("download_url") or item.get("url")
+        if not dl:
+            last_err = "返回无 download_url：" + str(item)
+            continue
+        return dl
+    raise RuntimeError("获取文件下载地址失败（已尝试云托管令牌/开放接口服务/AppSecret）：" + str(last_err))
 
 
 # ---------------- 大模型请求统一处理（同步 / 异步复用） ----------------
