@@ -984,7 +984,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"ok": False, "error": "缺少 file_url 或 fileID（云存储上传后回传）"})
             return None
         try:
-            with urllib.request.urlopen(dl, timeout=60) as r:
+            req_dl = urllib.request.Request(
+                dl,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; LiteratureLens/1.0)",
+                         "Referer": "https://servicewechat.com/"},
+            )
+            with urllib.request.urlopen(req_dl, timeout=60) as r:
                 pdf = r.read()
         except Exception as e:
             self._send(200, {"ok": False, "error": f"从云存储下载 PDF 失败：{e}"[:220]})
