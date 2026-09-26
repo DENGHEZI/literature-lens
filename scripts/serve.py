@@ -911,11 +911,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.wfile.write(body)
 
-    def _read_json(self):
-        """读取一个受限大小的 JSON 请求体；错误时返回 None。"""
+    # 普通 JSON 接口仍限制为 1MB；/api/upload-pdf 走 file_data(base64) 时需更大上限，
+    # 由 do_POST 在上传分支单独放宽。
+    _JSON_MAX = 1024 * 1024
+
+    def _read_json(self, max_bytes=None):
+        """读取一个受限大小的 JSON 请求体；错误时返回 None。
+
+        max_bytes 可覆盖默认上限（上传接口传 base64 时放宽到数十 MB）。
+        """
+        cap = int(max_bytes if max_bytes is not None else self._JSON_MAX)
         n = int(self.headers.get("Content-Length") or 0)
-        if n < 0 or n > 1024 * 1024:
-            self._send(413, {"ok": False, "error": "请求体过大"})
+        if n < 0 or n > cap:
+            self._send(413, {"ok": False, "error": "请求体过大（上限 %dMB）" % (cap // (1024 * 1024))})
             return None
         try:
             return json.loads(self.rfile.read(n).decode("utf-8") or "{}")
@@ -1370,7 +1378,8 @@ class Handler(BaseHTTPRequestHandler):
             if "multipart/form-data" in ctype:
                 meta = self._read_pdf_upload()
             else:
-                req = self._read_json()
+                # file_url / file_data(base64) 直传：放宽 JSON 上限到 30MB
+                req = self._read_json(max_bytes=30 * 1024 * 1024)
                 if req is None:
                     return
                 meta = self._read_pdf_upload_fileid(req)
