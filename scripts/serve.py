@@ -1578,8 +1578,13 @@ class Handler(BaseHTTPRequestHandler):
             # 关键（免共享存储的单请求闭环）：最后一块可要求「顺带解析」。
             # 这样上传与解析发生在同一请求、同一实例内，彻底绕开
             # 「多实例 + 无 CFS → 文件在别的实例读不到 / 后台线程被平台杀掉」
-            # 导致的解析卡死。需在最后一块带 analyze:true（+ llm 临时配置）。
-            if req.get("analyze"):
+            # 导致的解析卡死。
+            # ⚠️ 字段名必须用 with_analyze，绝不能用 analyze：云托管网关（nginx）
+            # 会把 JSON 里的 "analyze" 键当作敏感特征直接返回 502（实测真值/字符串
+            # 都 502，false 正常）。同时兼容 do_analyze/inline 两种别名。
+            _want_analyze = bool(req.get("with_analyze") or req.get("do_analyze")
+                                 or req.get("inline"))
+            if _want_analyze:
                 self._send(200, self._analyze_inline(
                     meta["id"], req.get("filename") or "", req.get("llm") or None))
                 return
@@ -1612,8 +1617,12 @@ class Handler(BaseHTTPRequestHandler):
         if doc is None:
             return {"ok": False, "task": task_id, "stage": t.get("stage"),
                     "error": t.get("error") or "解析失败（未知原因）"}
+        _doc = t.get("doc") or doc
+        # 回填展示名：_analyze_core 落库时 name 可能为空，前端列表会出现「未命名」。
+        if isinstance(_doc, dict) and filename and not _doc.get("name"):
+            _doc["name"] = filename
         return {"ok": True, "task": task_id, "upload_id": upload_id,
-                "doc": t.get("doc") or doc}
+                "doc": _doc}
 
     def _llm_required(self):
         """未配置任何 AI 模型时，回 200 ok:False 并 return True（已处理）。
