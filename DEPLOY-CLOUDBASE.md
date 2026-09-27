@@ -129,19 +129,39 @@ export const CLOUD_SERVICE = 'literature-lens'           // 部署后端后获�
    若运行时发现 callContainer 不返回二进制，则后端把页图存对象存储、返回临时 URL。
 
 ### 后端待办（部署真实服务前需补齐）
-- [ ] 大模型接口（chat/translate/translate-page/deepen/mindmap）改为异步任务 + 轮询，≤15s 返回任务号。
-- [ ] `/api/upload-pdf` 支持 `{"fileID": ...}` 入参：用微信 API 取回对象存储里的 PDF 再解析。
+- [x] 大模型接口（chat/translate/translate-page/deepen/mindmap）改为异步任务 + 轮询，≤15s 返回任务号。
+- [x] `/api/upload-pdf` 支持 `{"fileID": ...}` 入参：用微信 API 取回对象存储里的 PDF 再解析。
+- [x] `/api/upload-pdf-chunk` 分块直传（穿 callContainer ≤100KB 限制，零依赖兜底）。
+- [x] **按微信用户隔离**：文献库 / 上传 / 页图 / API Key 全部落到 `data/users/<openid>/`。
 - [ ] （可选）页图走对象存储返回 URL，替代 callContainer 二进制回传。
 - [ ] 部署后把真实 `CLOUD_SERVICE` 名回填到 `common/config.js`。
 
 ---
 
-## 六、多人共用 vs 各用各的
+## 六、多人共用 vs 各用各的（已实现按用户隔离）
 
-- 云托管后端是**一套共享服务**：所有用户看到同一份文献库（谁上传的 PDF 大家都能搜到）。
-- 手机端「我的 API 设置 / 研究方向 / 笔记 / 关键句 / 翻译缓存 / 统计」**仍只存在各自设备本地**，
-  不会互相串。
-- 若想「每个人独立的文献库」（多租户），需要额外加账号体系与按用户隔离，本期未做。
+**现状：每个微信用户拥有完全独立的文献库与 API Key，互不可见。**
+
+| 项目 | 隔离前 | 隔离后（本版） |
+|------|--------|----------------|
+| 文献库 | 全局一份，谁传的都搜得到 | `data/users/<openid>/lens_data.json`，只自己可见 |
+| 上传的 PDF | `uploads/` 全局共享 | `data/users/<openid>/uploads/` |
+| 原页图 | `data/pages/` 全局 | `data/users/<openid>/pages/` |
+| 自配 API Key | `config.user.json` 全局共享（**这就是体验账号串 Key 的原因**） | `data/users/<openid>/config.user.json` |
+| 解析任务 | 任何人拿到 task_id 都能读 | 任务带 uid，只对创建者可见 |
+
+**识别方式（无需小程序改代码）**：小程序用 `wx.cloud.callContainer` 调后端时，微信链路
+会**自动注入** `X-WX-OPENID` 请求头（官方文档《云托管 · 获取微信用户信息》）。后端读该头
+即可确认「这是谁」，因此不需要 `wx.login`、不需要 code 换 session、不需要自建登录态。
+> 前提：小程序基础库 ≥ 2.23.0；且只能被本云托管环境授权的小程序调用。
+> 切勿加 `X-WX-EXCLUDE-CREDENTIALS: openid`，否则头会被剥离、退化成匿名共享库。
+
+**兼容性**：无 openid 的请求（本地网页调试 / 旧版体验包 / 公网 `uni.request`）自动回退到
+「公共上下文」——沿用旧的全局 `data/lens_data.json` 与 `uploads/`，行为与升级前完全一致，
+现网不会因为这次改造而白屏或报错。
+
+**运维**：`data/` 是持久卷，`users/` 就在其下，所以换容器/重新部署都不会丢用户数据。
+想给某用户清库，只删 `data/users/<openid>/` 即可，不影响别人。
 
 ---
 

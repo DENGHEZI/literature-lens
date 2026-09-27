@@ -36,7 +36,13 @@ from sources import (discover_liyu_raw, discover_farmers,
 CONFIG = load_config()
 ROOT = os.path.dirname(HERE)
 OUT_DIR = CONFIG["output"]["dir"]
-DATA_DIR = os.path.join(ROOT, "data")
+# 页图落盘基准目录：默认 <repo>/data；多租户部署时由 serve.py 通过环境变量
+# LENS_PAGES_DIR 指向「当前用户」的数据目录（data/users/<openid>），使各用户页图
+# 互不可见。独立跑 pipeline 时该变量为空 → 行为与旧版完全一致。
+# 注意：只认 LENS_PAGES_DIR（由 serve 按当前用户动态设置），不要用 LENS_DATA_DIR
+# 这类进程级根目录变量，否则会把用户目录当成根、互相嵌套。
+DATA_DIR = os.path.abspath(os.environ.get("LENS_PAGES_DIR")
+                           or os.path.join(ROOT, "data"))
 LIM = CONFIG.get("limits") or {}
 
 # 原页图片（保留图表/公式排版，供网页「原文分屏」用）

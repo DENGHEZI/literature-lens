@@ -44,6 +44,13 @@ STATE = {"data": None, "llm": None, "az": None, "html": "",
          "doc_index": {}, "html_path": "", "data_path": "", "cfg": {},
          "upload_dir": ""}
 
+# ---------------- 多租户隔离（微信 openid → 各自独立的数据 / API / 上传） ----------------
+# STATE 始终指向「当前生效的租户上下文」，供既有的全局工具函数（_resolve_upload_pdf /
+# _page_image / _relevant_ctx 等）零改动复用；每个请求进入时用 _use_user() 切换。
+_PUBLIC = None                  # 无 openid 的匿名/公共上下文（本地网页、体验版旧链路）
+_USERS = {}                     # openid → 上下文 dict
+_USERS_LOCK = threading.RLock()
+
 # 上传解析任务表 + 数据文件写锁
 TASKS = {}
 _TASKS_LOCK = threading.Lock()
@@ -501,6 +508,167 @@ def _normalize_settings_payload(req):
     raise ValueError("请在表单中填写 API 信息,或选择一个预设")
 
 
+def _safe_oid(raw):
+    """把微信 openid 清洗成可安全拼路径的片段；非法/空 → 返回空串。
+
+    openid 官方形态是 28 位字母数字下划线（o 开头），这里放宽到 8-64 位
+    [A-Za-z0-9_-]，既能容纳 openid，也能容纳本地自测用的任意稳定 id。
+
+    关键：原始串里只要含路径相关字符（. / \\ 空格 等）一律拒绝，而不是「洗掉后
+    勉强接受」—— 后者会把 ../../etc/passwd 变成 etcpasswd 这种看似合法却来源
+    可疑的 id，宁可让它回退到公共上下文。
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", s):
+        return ""
+    return s
+
+
+def _openid_from(self, req=None):
+    """从请求里取微信 openid（云托管网关注入的头优先）。
+
+    优先级：
+      1. x-wechat-openid / x-wx-openid  —— 云托管 callContainer 网关自动注入（可信、免前端传）
+      2. x-lens-uid / uid               —— 前端显式携带的稳定用户标识（自建/兜底）
+      3. req.openid / req.uid / query uid —— 本地自测方便
+    取不到时返回空串 → 调用方回退到「公共上下文」（现网体验版照旧可用）。
+    """
+    cand = ""
+    for h in ("x-wechat-openid", "x-wx-openid", "x-lens-uid", "uid"):
+        v = (self.headers.get(h) or "").strip()
+        if v:
+            cand = v
+            break
+    if not cand and isinstance(req, dict):
+        for k in ("openid", "uid", "_uid"):
+            v = str(req.get(k) or "").strip()
+            if v:
+                cand = v
+                break
+    if not cand:
+        try:
+            q = urlparse(self.path).query or ""
+            m = re.search(r"(?:^|&)uid=([A-Za-z0-9_-]{8,64})", q)
+            if m:
+                cand = m.group(1)
+        except Exception:
+            pass
+    return _safe_oid(cand)
+
+
+def _base_root():
+    """进程级「数据根目录」——固定不变，绝不在按用户切上下文时被改写。
+
+    优先取环境变量 LENS_DATA_DIR（部署时可指向持久卷），否则用 <repo>/data。
+    注意：这是「根」，每个用户的数据都在它下面的 users/<oid>/ 里；
+    切勿把某个用户自己的目录写回这个变量，否则下一个用户会被嵌进上一个用户目录里。
+    """
+    root = os.path.dirname(HERE)
+    return os.path.abspath(os.environ.get("LENS_DATA_ROOT")
+                           or os.environ.get("LENS_DATA_DIR")
+                           or os.path.join(root, "data"))
+
+
+def _ctx_paths(oid):
+    """按 openid 规划该用户独立的各项路径。
+
+    oid 为空 → 沿用旧的全局路径（data/lens_data.json、uploads/、config.user.json），
+    保证现网体验版与本地网页零回归。
+    oid 非空 → 全部收进 data/users/<oid>/，与别的用户完全隔离：
+        users/<oid>/lens_data.json   文献库（含译文/创新点）
+        users/<oid>/uploads/         原始 PDF
+        users/<oid>/pages/           原页图（经 data_path 同级 pages/ 自动派生）
+        users/<oid>/config.user.json 该用户自备 API Key
+    """
+    root = os.path.dirname(HERE)
+    base = _base_root()
+    g_data = os.environ.get("LENS_DATA") or os.path.join(base, "lens_data.json")
+    g_up = os.path.join(root, "uploads")
+    g_cfg = os.path.join(root, "config.user.json")
+    if not oid:
+        return {"oid": "", "data": g_data, "upload": g_up, "config": g_cfg}
+    udir = os.path.join(base, "users", oid)
+    return {"oid": oid, "dir": udir,
+            "data": os.path.join(udir, "lens_data.json"),
+            "upload": os.path.join(udir, "uploads"),
+            "config": os.path.join(udir, "config.user.json")}
+
+
+def _ensure_user_data(paths):
+    """确保该用户的数据文件存在（首次注册即建库），并返回它。"""
+    if not os.path.exists(paths["data"]):
+        os.makedirs(os.path.dirname(paths["data"]) or ".", exist_ok=True)
+        with open(paths["data"], "w", encoding="utf-8") as f:
+            json.dump({"docs": []}, f, ensure_ascii=False)
+    os.makedirs(paths["upload"], exist_ok=True)
+    return paths["data"]
+
+
+def _build_ctx(oid):
+    """为一个 openid 构建（或复用）隔离上下文并载入其文献库与 API 配置。"""
+    paths = _ctx_paths(oid)
+    _ensure_user_data(paths)
+    data_path = paths["data"]
+    cfg = load_config(extra=[paths["config"]], require_provider=False,
+                      skip_global_user=True)
+    up_cfg = dict(cfg.get("uploads") or {})
+    up_cfg["dir"] = paths["upload"]        # 强制指向该用户自己的上传目录
+    cfg["uploads"] = up_cfg
+    data = json.load(open(data_path, encoding="utf-8"))
+    ctx = {
+        "oid": oid,
+        "paths": paths,
+        "data_path": data_path,
+        "upload_dir": os.path.abspath(paths["upload"]),
+        "cfg": cfg,
+        "data": data,
+        "doc_index": {d["id"]: d for d in (data.get("docs") or []) if d.get("id")},
+        "llm": CloudLLM(cfg.get("providers"), active=cfg.get("active_provider")),
+        "html": STATE.get("html") or "",
+        "html_path": STATE.get("html_path") or "",
+    }
+    ctx["az"] = Analyzer(ctx["llm"])
+    return ctx
+
+
+def _user_ctx(oid):
+    """取（或首次创建）某 openid 的上下文；oid 为空 → 公共上下文。"""
+    if not oid:
+        global _PUBLIC
+        with _USERS_LOCK:
+            if _PUBLIC is None:
+                _PUBLIC = _build_ctx("")
+            return _PUBLIC
+    with _USERS_LOCK:
+        ctx = _USERS.get(oid)
+        if ctx is None:
+            ctx = _build_ctx(oid)
+            _USERS[oid] = ctx
+        return ctx
+
+
+def _reload_ctx(ctx):
+    """配置/文献库变更后，重新载入该上下文（保持同一 dict 对象，指向新内容）。"""
+    fresh = _build_ctx(ctx.get("oid") or "")
+    ctx.update(fresh)
+    return ctx
+
+
+def _use_user(self, req=None):
+    """每个请求入口调用：按 openid 把 STATE 切到该用户自己的上下文。
+
+    返回 (oid, ctx)。此后所有走 STATE 的既有工具函数自动作用于该用户，
+    互不串库、互不串 Key。无 openid 时切到公共上下文（现网体验版零回归）。
+    """
+    oid = _openid_from(self, req)
+    ctx = _user_ctx(oid)
+    _ctx_state(oid)
+    os.makedirs(STATE["upload_dir"], exist_ok=True)
+    return oid, ctx
+
+
 def load(data_path, html_path=None, cfg=None):
     cfg = cfg or load_config()
     STATE["cfg"] = cfg
@@ -523,30 +691,42 @@ def _set_task(task_id, **kw):
         TASKS.setdefault(task_id, {}).update(kw)
 
 
-def _analyze_worker(task_id, upload_id, filename, llm_cfg=None):
+def _task_visible(task, oid):
+    """任务是否对当前用户可见：任务记录里带的 uid 与请求 uid 一致才可见。
+
+    兼容处理：老任务无 uid 字段时，仅对匿名（公共上下文）可见，避免误开放。
+    """
+    owner = str((task or {}).get("uid") or "")
+    return owner == (oid or "")
+
+
+def _analyze_worker(task_id, upload_id, filename, llm_cfg=None, oid=""):
     """后台解析上传的 PDF：抽取 → 术语 → 批量翻译 → 创新点分析 → 写入文献库。
 
     复用主流水线（pipeline.process_one），与离线批量分析产出同一套数据结构，
     因此前端速览卡 / 译文 / 原文页 / 创新点 / 知识点全部立即生效。
+    oid：该任务所属用户 —— 线程内先把 STATE 切到他的上下文，避免并发串库。
     """
     def set_task(**kw):
         _set_task(task_id, **kw)
+    ctx = _user_ctx(oid)
     try:
         from pipeline import process_one
         from translator import Translator
-        pdf_path = os.path.join(STATE["upload_dir"], upload_id + ".pdf")
+        _ctx_state(oid)                    # 线程内切到该用户，后续写入互不干扰
+        pdf_path = os.path.join(ctx["upload_dir"], upload_id + ".pdf")
         if not os.path.isfile(pdf_path):
             raise FileNotFoundError("上传文件已不存在，请重新上传")
         set_task(status="running", stage="正在抽取正文与原页图…")
         rec = {"filename": filename, "path": pdf_path}
-        llm = STATE["llm"]
-        # 优先用前端（手机）随请求传来的临时 Key；否则回退后端已配置的 provider。
-        # => 云端后端无需任何 AI 配置，PDF 解析直接用用户手机上已配好的 Key。
+        llm = ctx["llm"]
+        # 优先用前端（手机）随请求传来的临时 Key；否则回退该用户已保存的配置。
+        # => 谁的 Key 从哪来都只作用于谁自己的库，云端无需任何共享 AI 配置。
         if llm_cfg:
             try:
                 llm = _build_temporary_llm(llm_cfg)
             except Exception:
-                llm = STATE["llm"]
+                llm = ctx["llm"]
         has_llm = bool(llm and getattr(llm, "providers", None))
         tr = Translator(llm) if has_llm else None
         az = Analyzer(llm) if has_llm else None
@@ -561,17 +741,17 @@ def _analyze_worker(task_id, upload_id, filename, llm_cfg=None):
         set_task(stage="正在写入文献库…")
         # 写回数据文件（带锁，防止与其它任务并发写坏）
         with _DATA_LOCK:
-            raw = json.load(open(STATE["data_path"], encoding="utf-8"))
+            raw = json.load(open(ctx["data_path"], encoding="utf-8"))
             raw["docs"] = [d for d in (raw.get("docs") or []) if d.get("id") != doc["id"]]
             raw["docs"].append(doc)
-            tmp = STATE["data_path"] + ".tmp"
+            tmp = ctx["data_path"] + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(raw, f, ensure_ascii=False, indent=1)
-            os.replace(tmp, STATE["data_path"])
-        STATE["doc_index"][doc["id"]] = doc
-        STATE["data"]["docs"] = [d for d in (STATE["data"].get("docs") or [])
-                                 if d.get("id") != doc["id"]]
-        STATE["data"]["docs"].append(doc)
+            os.replace(tmp, ctx["data_path"])
+        ctx["doc_index"][doc["id"]] = doc
+        ctx["data"]["docs"] = [d for d in (ctx["data"].get("docs") or [])
+                               if d.get("id") != doc["id"]]
+        ctx["data"]["docs"].append(doc)
         # 给前端的副本：pages_img 换成可访问的服务端 URL
         out = json.loads(json.dumps(doc, ensure_ascii=False))
         out["pages_img"] = {str(k): f"data/pages/{doc['id']}/p{k}.jpg"
@@ -580,9 +760,9 @@ def _analyze_worker(task_id, upload_id, filename, llm_cfg=None):
         # 后台重渲染离线网页（双击打开也能看到新文献）
         try:
             import render as _render
-            hp = STATE["html_path"] or None
+            hp = ctx.get("html_path") or None
             if hp:
-                _render.render(STATE["data_path"], hp)
+                _render.render(ctx["data_path"], hp)
         except Exception:
             pass
     except Exception as e:
@@ -593,7 +773,39 @@ def _analyze_worker(task_id, upload_id, filename, llm_cfg=None):
         set_task(status="error", stage="解析失败", error=msg)
 
 
-def _reanalyze_worker(task_id, doc_id):
+def _ctx_state(oid):
+    """在线程内把 STATE 切到指定用户的上下文（供后台任务复用既有工具函数）。
+
+    这是隔离生效的关键一步：所有既有工具函数（_resolve_upload_pdf / _page_image /
+    _relevant_ctx / _llm_required …）都读 STATE，所以必须把 STATE 换成该用户自己的
+    cfg / 库 / LLM，之后它们才会作用于正确的人。
+    """
+    ctx = _user_ctx(oid)
+    STATE.update({
+        "cfg": ctx["cfg"], "data_path": ctx["data_path"], "data": ctx["data"],
+        "doc_index": ctx["doc_index"], "llm": ctx["llm"], "az": ctx["az"],
+        "upload_dir": ctx["upload_dir"],
+    })
+    _bind_env(oid, ctx)
+    return ctx
+
+
+def _bind_env(oid, ctx):
+    """把「当前用户的数据目录」发布到一个专用环境变量，供 pipeline 落页图时使用。
+
+    关键：绝不能改写 LENS_DATA_ROOT / LENS_DATA_DIR（那是进程级数据根，一旦被
+    改成某个用户的目录，下一个用户就会被嵌进上一个用户的目录里）。
+    这里只写 LENS_PAGES_DIR 这个只有 pipeline 消费的变量。
+    """
+    d = os.path.dirname(ctx["data_path"])
+    try:
+        os.environ["LENS_PAGES_DIR"] = d
+    except Exception:
+        pass
+    return d
+
+
+def _reanalyze_worker(task_id, doc_id, oid=""):
     """重新解析已有文献：重跑 抽取→术语→翻译→创新点分析，并保持原 doc id 不变。
 
     用途：上传时 API Key 失效导致速览卡/译文为空，配好 Key 后一键补救；
@@ -601,10 +813,11 @@ def _reanalyze_worker(task_id, doc_id):
     """
     def set_task(**kw):
         _set_task(task_id, **kw)
+    ctx = _ctx_state(oid)
     try:
         from pipeline import process_one
         from translator import Translator
-        old = STATE["doc_index"].get(doc_id)
+        old = ctx["doc_index"].get(doc_id)
         if not old:
             raise FileNotFoundError("文献不存在或已被移除")
         pdf_path = _resolve_upload_pdf(old)
@@ -613,8 +826,8 @@ def _reanalyze_worker(task_id, doc_id):
         set_task(status="running", stage="正在抽取正文与原页图…")
         rec = {"filename": (old.get("meta") or {}).get("filename") or "",
                "path": pdf_path}
-        tr = Translator(STATE["llm"])
-        doc = process_one(rec, STATE["llm"], tr, STATE["az"], max_pages=8)
+        tr = Translator(ctx["llm"])
+        doc = process_one(rec, ctx["llm"], tr, ctx["az"], max_pages=8)
         doc["id"] = doc_id                      # 保持原 id，前端选中所见即所得
         old_meta = old.get("meta") or {}
         doc["meta"]["source"] = old_meta.get("source") or "本地上传"
@@ -623,26 +836,26 @@ def _reanalyze_worker(task_id, doc_id):
             doc["meta"]["upload_id"] = old_meta["upload_id"]
         set_task(stage="正在写入文献库…")
         with _DATA_LOCK:
-            raw = json.load(open(STATE["data_path"], encoding="utf-8"))
+            raw = json.load(open(ctx["data_path"], encoding="utf-8"))
             raw["docs"] = [d for d in (raw.get("docs") or [])
                            if d.get("id") != doc["id"]]
             raw["docs"].append(doc)
-            tmp = STATE["data_path"] + ".tmp"
+            tmp = ctx["data_path"] + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(raw, f, ensure_ascii=False, indent=1)
-            os.replace(tmp, STATE["data_path"])
-        STATE["doc_index"][doc["id"]] = doc
-        STATE["data"]["docs"] = [d for d in (STATE["data"].get("docs") or [])
-                                 if d.get("id") != doc["id"]]
-        STATE["data"]["docs"].append(doc)
+            os.replace(tmp, ctx["data_path"])
+        ctx["doc_index"][doc["id"]] = doc
+        ctx["data"]["docs"] = [d for d in (ctx["data"].get("docs") or [])
+                               if d.get("id") != doc["id"]]
+        ctx["data"]["docs"].append(doc)
         out = json.loads(json.dumps(doc, ensure_ascii=False))
         out["pages_img"] = {str(k): f"data/pages/{doc['id']}/p{k}.jpg"
                             for k in (doc.get("pages_img") or {})}
         set_task(status="done", stage="完成", doc=out, doc_id=doc["id"])
         try:
             import render as _render
-            if STATE["html_path"]:
-                _render.render(STATE["data_path"], STATE["html_path"])
+            if ctx.get("html_path"):
+                _render.render(ctx["data_path"], ctx["html_path"])
         except Exception:
             pass
     except Exception as e:
@@ -981,11 +1194,15 @@ def _handle_llm_action(action, req):
     return None, f"未知 action：{action}"
 
 
-def _llm_worker(task_id, action, req):
-    """后台跑大模型请求，结果写入 TASKS（callContainer ≤15s 异步化）。"""
+def _llm_worker(task_id, action, req, oid=""):
+    """后台跑大模型请求，结果写入 TASKS（callContainer ≤15s 异步化）。
+
+    oid：任务所属用户 —— 线程内先切 STATE 到他的上下文，保证异步生成也走他自己的库与 Key。
+    """
     def set_task(**kw):
         _set_task(task_id, **kw)
     try:
+        _ctx_state(oid)
         set_task(status="running", stage=_LLM_STAGE.get(action, "AI 生成中…"))
         result, err = _handle_llm_action(action, req)
         if err:
@@ -1247,7 +1464,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, x-wechat-openid, x-wx-openid, x-lens-uid, uid")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
         self.end_headers()
 
@@ -1262,6 +1480,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = urlparse(self.path).path
+        # 先按 openid 切到该用户上下文：此后所有 STATE 读写都是他自己的库/Key/上传。
+        oid, _ctx = _use_user(self)
         if p in ("/", "/index.html", "/lens"):
             # 每次请求都重读网页，改完 template + render 后刷新即可看到
             if STATE["html_path"] and os.path.exists(STATE["html_path"]):
@@ -1287,6 +1507,8 @@ class Handler(BaseHTTPRequestHandler):
                 "provider": act.get("id", ""),
                 "protocol": _norm_protocol(act) if act else "",
                 "n_docs": len(STATE["doc_index"]),
+                "uid": oid,                       # 非空 = 已识别到微信用户（各自独立库/Key）
+                "isolated": bool(oid),
                 "providers": llm.list_providers() if llm else [],
             })
         elif p == "/api/models":
@@ -1295,14 +1517,18 @@ class Handler(BaseHTTPRequestHandler):
                              "providers": STATE["llm"].list_providers() if STATE["llm"] else []})
         elif p == "/api/settings":
             # 只返回可展示的配置,绝不把 API key 回传到浏览器。
+            # 每个用户看到的是自己的 provider（来自 users/<oid>/config.user.json），互不可见。
             ps = STATE["llm"].list_providers() if STATE["llm"] else []
             act_id = STATE["llm"].active if STATE["llm"] else ""
             active = next((p for p in ps if p["id"] == act_id), None)
+            cfg_path = (_ctx.get("paths") or {}).get("config") \
+                or os.path.join(os.path.dirname(HERE), "config.user.json")
             self._send(200, {
                 "ok": True,
                 "active": act_id,
                 "providers": ps,
-                "has_user_config": os.path.isfile(os.path.join(os.path.dirname(HERE), "config.user.json")),
+                "has_user_config": os.path.isfile(cfg_path),
+                "uid": oid,                      # 前端可据此确认「已按用户隔离」
                 "active_summary": {
                     "id": active["id"], "name": active["name"],
                     "model": active["model"], "protocol": active["protocol"]
@@ -1317,7 +1543,8 @@ class Handler(BaseHTTPRequestHandler):
             tid = m.group(1) if m else ""
             with _TASKS_LOCK:
                 t = dict(TASKS.get(tid) or {})
-            if not t:
+            # 任务归属校验：任务只对创建它的用户可见，杜绝跨用户偷看解析结果
+            if not t or not _task_visible(t, oid):
                 self._send(404, {"ok": False, "error": "未知解析任务"})
                 return
             self._send(200, {"ok": True, **t})
@@ -1328,7 +1555,7 @@ class Handler(BaseHTTPRequestHandler):
             tid = m.group(1) if m else ""
             with _TASKS_LOCK:
                 t = dict(TASKS.get(tid) or {})
-            if not t:
+            if not t or not _task_visible(t, oid):
                 self._send(404, {"ok": False, "error": "未知任务"})
                 return
             self._send(200, {"ok": True, **t})
@@ -1448,6 +1675,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = urlparse(self.path).path
+        # 先按 openid 切到该用户上下文：此后解析/翻译/生成全部用他自己的库与 Key。
+        oid, _ctx = _use_user(self)
         if p == "/api/test":
             # 用临时表单里的配置做一次连通性+JSON 能力探测,绝不落盘。
             # 既支持"测已存 provider",也支持"测用户即将填的新 API"。
@@ -1602,8 +1831,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             task_id = uuid.uuid4().hex
             _set_task(task_id, status="queued", stage=_LLM_STAGE.get(action, "排队中…"),
-                      action=action, created_at=int(time.time()))
-            threading.Thread(target=_llm_worker, args=(task_id, action, req.get("payload") or {}),
+                      action=action, uid=oid, created_at=int(time.time()))
+            threading.Thread(target=_llm_worker, args=(task_id, action, req.get("payload") or {}, oid),
                              daemon=True).start()
             self._send(200, {"ok": True, "task": task_id})
             return
@@ -1623,13 +1852,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             task_id = uuid.uuid4().hex
             _set_task(task_id, status="queued", stage="排队中…",
-                      upload_id=upload_id, filename=filename,
+                      upload_id=upload_id, filename=filename, uid=oid,
                       created_at=int(time.time()))
             # 允许前端（手机）随请求带来临时 LLM 配置（用手机已配的 Key），后端无需任何 AI 配置
             llm_cfg = req.get("llm") or None
             threading.Thread(
                 target=_analyze_worker,
-                args=(task_id, upload_id, filename, llm_cfg),
+                args=(task_id, upload_id, filename, llm_cfg, oid),
                 daemon=True,
             ).start()
             self._send(200, {"ok": True, "task": task_id})
@@ -1646,9 +1875,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, {"ok": False, "error": "文献不存在"})
                 return
             task_id = uuid.uuid4().hex
-            _set_task(task_id, status="queued", stage="排队中…", doc_id=did,
+            _set_task(task_id, status="queued", stage="排队中…", doc_id=did, uid=oid,
                       created_at=int(time.time()))
-            threading.Thread(target=_reanalyze_worker, args=(task_id, did),
+            threading.Thread(target=_reanalyze_worker, args=(task_id, did, oid),
                              daemon=True).start()
             self._send(200, {"ok": True, "task": task_id})
             return
@@ -1657,7 +1886,8 @@ class Handler(BaseHTTPRequestHandler):
             #   - {single: {...}}                        单 API 全角色(推荐,90% 用户)
             #   - {preset: "deepseek", api_key: "..."}   预设 + 只粘 Key
             #   - {translation: {...}, reasoning: {...}} 双 API 模式(沿用兼容)
-            # key 只写入本机 config.user.json,不出现在响应体/日志/网页。
+            # key 只写入「该用户自己的」users/<oid>/config.user.json（无 openid 时为旧的
+            # 全局 config.user.json），绝不出现在响应体/日志/网页，也不与别的用户共享。
             req = self._read_json()
             if req is None:
                 return
@@ -1671,16 +1901,19 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(400, {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
                 return
-            save_user_config({"active_provider": active, "providers": providers})
+            cfg_path = (_ctx.get("paths") or {}).get("config")
+            save_user_config({"active_provider": active, "providers": providers},
+                             path=cfg_path)
             try:
-                load(STATE["data_path"], STATE["html_path"],
-                     load_config(require_provider=False))
+                _reload_ctx(_ctx)                 # 只重载该用户上下文，不影响他人
+                _ctx_state(oid)
             except Exception as e:
                 self._send(500, {"ok": False, "error": f"配置保存了,但重新载入失败:{e}"[:220]})
                 return
             self._send(200, {
                 "ok": True,
                 "active": active,
+                "uid": oid,
                 "providers": STATE["llm"].list_providers(),
                 "message": payload.get("message", "用户 API 已启用并热重载。")
             })
@@ -1703,9 +1936,11 @@ class Handler(BaseHTTPRequestHandler):
             eg["proxy"] = {k: str(prox.get(k) or "").strip()
                            for k in ("http", "https", "no_proxy")}
             try:
-                save_user_config({"egress": eg})
+                cfg_path = (_ctx.get("paths") or {}).get("config")
+                save_user_config({"egress": eg}, path=cfg_path)
                 applied = apply_proxy(eg)
                 STATE["cfg"]["egress"] = eg
+                _ctx["cfg"]["egress"] = eg
                 self._send(200, {
                     "ok": True,
                     "applied": applied,
@@ -1957,11 +2192,20 @@ def main():
     if a.provider:
         cfg["active_provider"] = a.provider
     load(a.data, a.html, cfg)
+    # 初始化「公共上下文」（无 openid 的匿名请求 / 本地网页 / 现网体验版旧链路）。
+    # 每个真实用户（带 openid）首次访问时会自动建自己的 users/<oid>/ 独立库与 Key。
+    global _PUBLIC
+    _PUBLIC = {
+        "oid": "", "paths": _ctx_paths(""), "data_path": a.data,
+        "upload_dir": STATE["upload_dir"], "cfg": STATE["cfg"],
+        "data": STATE["data"], "doc_index": STATE["doc_index"],
+        "llm": STATE["llm"], "az": STATE["az"],
+        "html": STATE["html"], "html_path": a.html or "",
+    }
+    _bind_env("", _PUBLIC)
     # 接管用户访问互联网的地址：把代理写进进程级环境变量，
     # 全服务（翻译 API + 学术检索）统一经此出口出网。
     apply_proxy(cfg.get("egress"))
-    if a.provider:
-        STATE["az"].pid = a.provider
 
     llm = STATE["llm"]
     url = f"http://{a.host}:{a.port}/"
@@ -1985,6 +2229,7 @@ def main():
         off = " [禁用]" if not p["enabled"] else ""
         print(f"     - {p['id']:<12} {p['name']:<22} {p['model']}{off}{flag}")
     print(f"  文献：{len(STATE['doc_index'])} 篇")
+    print(f"  多租户：已开启（微信用户各自独立库/Key，目录 {os.path.join(_base_root(), 'users')}）")
     print("  按 Ctrl+C 停止")
     print("=" * 60)
     if a.open:

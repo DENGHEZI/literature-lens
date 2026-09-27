@@ -73,13 +73,16 @@ def _merge(base, top):
     return out
 
 
-def _candidate_paths(extra=None):
+def _candidate_paths(extra=None, skip_global_user=False):
     paths = []
     env = os.environ.get("LITERATURE_LENS_CONFIG")
     if env:
         paths += [x.strip() for x in env.split(",") if x.strip()]
     paths.append(os.path.join(ROOT, "config.json"))
-    paths.append(os.path.join(ROOT, "config.user.json"))
+    # 多租户场景：每个用户有自己的 config.user.json（经 extra 传入），
+    # 绝不能再叠加「根目录那份共享 config.user.json」，否则会把别人的 Key 串进来。
+    if not skip_global_user:
+        paths.append(os.path.join(ROOT, "config.user.json"))
     if extra:
         if isinstance(extra, str):
             extra = [x.strip() for x in extra.split(",") if x.strip()]
@@ -87,11 +90,14 @@ def _candidate_paths(extra=None):
     return paths
 
 
-def load_config(extra=None, require_provider=True):
-    """返回合并后的配置字典。缺失 provider 时给出可读报错。"""
+def load_config(extra=None, require_provider=True, skip_global_user=False):
+    """返回合并后的配置字典。缺失 provider 时给出可读报错。
+
+    skip_global_user=True：不加载根目录共享的 config.user.json（多租户按用户隔离时用）。
+    """
     cfg = dict(DEFAULTS)
     used = []
-    for p in _candidate_paths(extra):
+    for p in _candidate_paths(extra, skip_global_user=skip_global_user):
         if p and os.path.isfile(p):
             try:
                 with open(p, encoding="utf-8") as f:
