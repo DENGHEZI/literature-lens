@@ -1612,6 +1612,15 @@ class Handler(BaseHTTPRequestHandler):
                 t = dict(TASKS.get(task_id) or {})
             return {"ok": False, "task": task_id, "stage": t.get("stage"),
                     "error": f"{type(e).__name__}: {e}"[:260]}
+        except BaseException as e:
+            # 关键兜底：SystemExit / KeyboardInterrupt 继承自 BaseException，
+            # 不会被上面的 except Exception 捕获。若在请求线程里逸出，会直接
+            # 终止整个服务进程 —— 线上表现为网关立即 502。这里一律转成正常
+            # 错误响应，绝不让解析异常升级为「服务被杀」。
+            with _TASKS_LOCK:
+                t = dict(TASKS.get(task_id) or {})
+            return {"ok": False, "task": task_id, "stage": t.get("stage"),
+                    "error": f"{type(e).__name__}: {e}"[:260]}
         with _TASKS_LOCK:
             t = dict(TASKS.get(task_id) or {})
         if doc is None:

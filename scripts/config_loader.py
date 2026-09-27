@@ -22,6 +22,16 @@ import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+class ConfigError(Exception):
+    """配置错误（普通 Exception，可被调用方正常捕获）。
+
+    ⚠️ 绝不能用 SystemExit：它继承自 BaseException，不会被 `except Exception`
+    捕获。本项目 serve.py 会在「请求处理线程」里调用 load_config()，若此处抛
+    SystemExit，异常会穿透到线程顶层导致服务进程退出 —— 线上表现为网关
+    立即返回 nginx 502（实测：带解析参数的上传请求 0.17s 即 502，且服务
+    进程被杀死）。"""
+
 _ENV_RX = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 DEFAULTS = {
@@ -104,12 +114,12 @@ def load_config(extra=None, require_provider=True, skip_global_user=False):
                     cfg = _merge(cfg, json.load(f))
                 used.append(p)
             except Exception as e:
-                raise SystemExit(f"[config] 解析失败 {p}: {e}")
+                raise ConfigError(f"[config] 解析失败 {p}: {e}")
     cfg = _expand_env(cfg)
     cfg["_loaded_from"] = used
     if require_provider:
         if not cfg.get("providers"):
-            raise SystemExit(
+            raise ConfigError(
                 "[config] 未配置任何 provider。\n"
                 "请在 config.json（或 config.user.json）里填：\n"
                 '  {"providers":[{"id":"any","base_url":"https://.../v1",'
