@@ -1485,7 +1485,15 @@ class Handler(BaseHTTPRequestHandler):
         if not self._CHUNK_ID_RE.match(upload_id):
             self._send(400, {"ok": False, "error": "upload_id 不合法（需 8-64 位十六进制）"})
             return
-        tmp = os.path.join(tempfile.gettempdir(), "lens_chunk_" + upload_id + ".b64")
+        # 分块临时文件必须落在持久卷（LENS_DATA_DIR）而非容器 /tmp：
+        # 多实例 / 实例回收时 /tmp 是每个实例私有的，第 1 块在实例 A、第 2 块
+        # 到实例 B，组装必然失败（表现为「分块上传完成但未返回结果」）。
+        _chunk_dir = os.path.join(_base_root(), "_chunks")
+        try:
+            os.makedirs(_chunk_dir, exist_ok=True)
+        except Exception:
+            _chunk_dir = tempfile.gettempdir()
+        tmp = os.path.join(_chunk_dir, "lens_chunk_" + upload_id + ".b64")
         if req.get("abort"):
             try:
                 if os.path.exists(tmp):
@@ -1940,12 +1948,29 @@ class Handler(BaseHTTPRequestHandler):
                 return
             upload_id = (req.get("upload_id") or "").strip()
             filename = (req.get("filename") or "").strip()
+            # 自愈：多实例/实例回收部署下，上传可能落在另一实例的本地盘，
+            # 本实例找不到文件。此时若前端愿意随请求再带一份 base64（file_data），
+            # 就地重建，让「上传→解析」在同一实例内闭环，无需依赖共享存储。
+            file_data = req.get("file_data") or None
+            if file_data and not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+                upload_id = uuid.uuid4().hex
+            if file_data:
+                try:
+                    _raw = base64.b64decode(file_data)
+                    os.makedirs(STATE["upload_dir"], exist_ok=True)
+                    with open(os.path.join(STATE["upload_dir"], upload_id + ".pdf"), "wb") as f:
+                        f.write(_raw)
+                except Exception as e:
+                    self._send(400, {"ok": False, "error": f"file_data 解码失败：{e}"[:200]})
+                    return
             if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
                 self._send(400, {"ok": False, "error": "无效的 upload_id"})
                 return
             pdf_path = os.path.join(STATE["upload_dir"], upload_id + ".pdf")
             if not os.path.isfile(pdf_path):
-                self._send(404, {"ok": False, "error": "上传文件已过期或不存在，请重新上传"})
+                self._send(404, {"ok": False, "need_reupload": True,
+                                 "error": "上传文件在本实例不存在（多实例未共享存储）。"
+                                          "请重传该文件，或在请求中附带 file_data。"})
                 return
             task_id = uuid.uuid4().hex
             _set_task(task_id, status="queued", stage="排队中…",
