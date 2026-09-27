@@ -713,6 +713,7 @@ def _analyze_worker(task_id, upload_id, filename, llm_cfg=None, oid=""):
     try:
         from pipeline import process_one
         from translator import Translator
+        import concurrent.futures as _cf
         _ctx_state(oid)                    # 线程内切到该用户，后续写入互不干扰
         pdf_path = os.path.join(ctx["upload_dir"], upload_id + ".pdf")
         if not os.path.isfile(pdf_path):
@@ -734,7 +735,19 @@ def _analyze_worker(task_id, upload_id, filename, llm_cfg=None, oid=""):
             set_task(status="error", stage="解析失败",
                      error="后端未配置 AI 模型且前端未提供 Key；请在「设置 → API」填写 Key")
             return
-        doc = process_one(rec, llm, tr, az, max_pages=8)
+        # 整体解析超时保护：避免任何异常（典型如模型服务出网挂起）让任务永远
+        # 停在 running。超时立即标记失败，前端不再无限转圈。可用环境变量
+        # LENS_ANALYZE_TIMEOUT（秒）调整上限。
+        _analyze_timeout = int(os.environ.get("LENS_ANALYZE_TIMEOUT", "180"))
+        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(process_one, rec, llm, tr, az, max_pages=8)
+            try:
+                doc = _fut.result(timeout=_analyze_timeout)
+            except _cf.TimeoutError:
+                set_task(status="error", stage="解析超时",
+                         error=f"解析超过 {_analyze_timeout}s 未完成（多半是模型服务无响应，"
+                               f"请检查后端出网 / API Key / 模型地址是否可达）")
+                return
         doc["meta"]["source"] = "本地上传"
         doc["meta"]["source_key"] = "upload"
         doc["meta"]["upload_id"] = upload_id   # 内置 PDF 阅读器按此找回原始文件

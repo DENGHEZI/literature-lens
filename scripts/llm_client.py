@@ -246,7 +246,7 @@ class CloudLLM:
         }
     """
 
-    def __init__(self, providers=None, active=None, timeout=180, retries=3):
+    def __init__(self, providers=None, active=None, timeout=30, retries=2):
         cfg_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
         cfg = {}
@@ -506,11 +506,14 @@ class CloudLLM:
                         continue
                     break
                 except urllib.error.URLError as e:
-                    last_err = f"网络不可达：{e}"
-                    time.sleep(min(1.5 * (attempt + 1), 8))
+                    # 网络层错误（DNS 解析失败 / 连接被拒 / 连接或读取超时）是
+                    # 确定性的，重试既无效又会累积挂起时长（最坏 4组合×N次×
+                    # timeout 秒），导致翻译任务卡死十几分钟。直接失败，把
+                    # 明确错误尽快抛给上层，让前端看到「解析失败」而非一直转圈。
+                    raise LLMError(f"网络不可达：{e}（请检查后端出网或 API 地址是否可达）")
                 except Exception as e:
                     last_err = f"{type(e).__name__}: {e}"
-                    time.sleep(min(1.5 * (attempt + 1), 8))
+                    time.sleep(min(1.0 * (attempt + 1), 4))
 
         self._bump(p.get("id"), 0, 0, err=True)
         raise LLMError(f"调用失败（provider={p.get('id')} model={p.get('model')}）：{last_err}")
