@@ -133,8 +133,13 @@ export const CLOUD_SERVICE = 'literature-lens'           // 部署后端后获�
 - [x] `/api/upload-pdf` 支持 `{"fileID": ...}` 入参：用微信 API 取回对象存储里的 PDF 再解析。
 - [x] `/api/upload-pdf-chunk` 分块直传（穿 callContainer ≤100KB 限制，零依赖兜底）。
 - [x] **按微信用户隔离**：文献库 / 上传 / 页图 / API Key 全部落到 `data/users/<openid>/`。
+- [x] **解析提速**：翻译批次线程池并发（默认 2，可调）、术语抽取与创新点分析并行、原页渲染移入后台线程，整体耗时显著下降。
 - [ ] （可选）页图走对象存储返回 URL，替代 callContainer 二进制回传。
 - [ ] 部署后把真实 `CLOUD_SERVICE` 名回填到 `common/config.js`。
+
+> **解析速度调优**：翻译并发批数由环境变量 `LENS_TRANS_WORKERS` 控制（默认 `2`，
+> 调大会更快但更易触发服务商限流，建议在 CloudBase 环境变量里按套餐从 `2`→`4` 试）。
+> 术语抽取与创新点分析在英文文献下本就并行，无需额外配置。
 
 ---
 

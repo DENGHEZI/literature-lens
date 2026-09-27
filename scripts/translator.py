@@ -10,7 +10,9 @@
 模型无关：所有结构化输出都经 coerce_list / parse_json_loose 容错，
           不假设模型一定按「纯数组」或「纯对象」返回。
 """
+import os
 import re
+import threading
 
 from llm_client import coerce_list
 
@@ -60,12 +62,23 @@ def unmask(text, store):
 class Translator:
     """结构化翻译。pid 指定用哪个 provider；不指定则按 translate 角色自动挑。"""
 
-    def __init__(self, llm, max_chars=2600, pid=None):
+    def __init__(self, llm, max_chars=2600, pid=None, max_workers=None):
         self.llm = llm
         self.max_chars = max_chars
         self.pid = pid
         self.role = "translate"
         self._cache = {}
+        self._cache_lock = threading.Lock()
+        # 并发翻译批数：默认 2（保守，避免触发服务商限流）；
+        # 可用环境变量 LENS_TRANS_WORKERS 调大/调小，或构造时传 max_workers。
+        try:
+            env_w = int(os.environ.get("LENS_TRANS_WORKERS", "2"))
+        except Exception:
+            env_w = 2
+        env_w = max(1, env_w)
+        if max_workers is None:
+            max_workers = env_w
+        self.max_workers = max(1, int(max_workers))
 
     def _call(self, prompt, system=None, max_tokens=2400, temperature=0.2, json_mode=False):
         """统一出调用：优先 pid，其次按角色挑 provider。"""
@@ -118,12 +131,11 @@ class Translator:
         if not blocks:
             return {}
         whole = {b["idx"]: b["text"] for b in blocks}
-        # 命中缓存
-        todo = [b for b in blocks if b["text"] not in self._cache]
-        for b in blocks:
-            if b["text"] in self._cache:
-                whole[b["idx"]] = self._cache[b["text"]]
-        hit = {b["idx"]: self._cache[b["text"]] for b in blocks if b["text"] in self._cache}
+        # 命中缓存（加锁，避免与并发批次互相踩）
+        with self._cache_lock:
+            hit = {b["idx"]: self._cache[b["text"]]
+                   for b in blocks if b["text"] in self._cache}
+        todo = [b for b in blocks if b["idx"] not in hit]
 
         if not todo:
             return hit
@@ -163,7 +175,8 @@ class Translator:
         for b in todo:
             txt = got.get(b["idx"])
             if txt and len(txt) > 2:
-                self._cache[b["text"]] = txt
+                with self._cache_lock:
+                    self._cache[b["text"]] = txt
                 out[b["idx"]] = txt
             else:
                 out[b["idx"]] = ""     # 标记缺失，由上层决定是否重试
@@ -209,26 +222,63 @@ class Translator:
         return unmask((out or "").strip(), st)
 
     # ---------- 全文翻译（自动分批判 + 缺段补齐） ----------
-    def translate_blocks(self, blocks, terms=None, progress=None):
-        """返回 {idx: 译文}，保证每个非公式块的 idx 都有键。"""
+    def translate_blocks(self, blocks, terms=None, progress=None, max_workers=None):
+        """返回 {idx: 译文}，保证每个非公式块的 idx 都有键。
+
+        批与批相互独立，用线程池并发翻译以缩短总耗时；单批失败不影响其它批。
+        并发度 = min(批数, max_workers)，max_workers 默认取实例值（见 __init__）。
+        """
         result = {}
         batches = self._batch(blocks)
-        for bi, batch in enumerate(batches, 1):
-            if progress:
-                progress(bi, len(batches))
-            try:
-                got = self.translate_batch(batch, terms=terms)
-            except Exception as e:
-                got = {b["idx"]: "" for b in batch}
+        n = len(batches)
+        w = int(max_workers) if max_workers else self.max_workers
+        w = max(1, min(w, n)) if n else 1
+
+        if w <= 1 or n <= 1:
+            # 单批或指定串行：行为与旧版完全一致
+            for bi, batch in enumerate(batches, 1):
                 if progress:
-                    progress(bi, len(batches), err=str(e)[:120])
-            result.update(got)
-        # 缺段补齐（单段重试）
+                    progress(bi, n)
+                try:
+                    got = self.translate_batch(batch, terms=terms)
+                except Exception as e:
+                    got = {b["idx"]: "" for b in batch}
+                    if progress:
+                        progress(bi, n, err=str(e)[:120])
+                result.update(got)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            done = 0
+            with ThreadPoolExecutor(max_workers=w) as ex:
+                futs = {ex.submit(self.translate_batch, b, terms): i
+                        for i, b in enumerate(batches, 1)}
+                for fut in futs:
+                    bi = futs[fut]
+                    done += 1
+                    if progress:
+                        progress(done, n)
+                    try:
+                        got = fut.result()
+                    except Exception as e:
+                        got = {b["idx"]: "" for b in batches[bi - 1]}
+                        if progress:
+                            progress(done, n, err=str(e)[:120])
+                    result.update(got)
+
+        # 缺段补齐（单段重试，同样走线程池并发）
         missing = [b for b in blocks if not result.get(b["idx"])]
-        for b in missing:
-            t = self.translate_one(b, terms=terms)
-            if t:
-                result[b["idx"]] = t
+        if missing:
+            from concurrent.futures import ThreadPoolExecutor
+            w2 = max(1, min(w, len(missing)))
+            with ThreadPoolExecutor(max_workers=w2) as ex:
+                futs = {ex.submit(self.translate_one, b, terms): b for b in missing}
+                for fut, b in futs.items():
+                    try:
+                        t = fut.result()
+                    except Exception:
+                        t = ""
+                    if t:
+                        result[b["idx"]] = t
         return result
 
     def _batch(self, blocks):

@@ -21,6 +21,7 @@ import sys
 import json
 import time
 import argparse
+import concurrent.futures
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -58,6 +59,62 @@ def log(*a):
     print("  ", *a, flush=True)
 
 
+def _render_pages(path, did, max_pages):
+    """原页渲染 + 词级文本层（纯本地 IO）。
+
+    抽成函数以便放进后台线程，与 LLM 调用并行，缩短总耗时。
+    行为与原内联版本完全一致（仍落 DATA_DIR，保证 serve 按约定路径回读页图）。
+    """
+    pages_img, pages_txt, pages_txt_meta = {}, {}, {}
+    if not PI_ON:
+        return pages_img, pages_txt, pages_txt_meta
+    try:
+        imgs = render_page_images(
+            path, os.path.join(DATA_DIR, "pages", did),
+            zoom=PI_ZOOM, quality=PI_QUALITY,
+            max_pages=max_pages)
+        pages_img = {str(p["page"]): os.path.relpath(p["file"], ROOT)
+                     .replace("\\", "/") for p in imgs}
+        if imgs:
+            log(f"  原页图片 {len(imgs)} 张")
+        if PI_WORDS and imgs:
+            try:
+                pages_txt, pages_txt_meta = extract_word_boxes(
+                    path, [p["page"] for p in imgs], with_meta=True)
+                if pages_txt:
+                    n_w = sum(len(v) for v in pages_txt.values())
+                    log(f"  词级文本层 {n_w} 词（划词翻译用）")
+                for k in ("scanned_pages", "rotated_pages",
+                          "truncated_pages", "no_text_pages"):
+                    if (pages_txt_meta or {}).get(k):
+                        log(f"  页适配 · {k}: {pages_txt_meta[k]}")
+                if (pages_txt_meta or {}).get("err"):
+                    log(f"  页适配 · 警告: {pages_txt_meta['err']}")
+            except Exception as e:
+                log(f"  文本层提取失败（不影响其他流程）：{type(e).__name__}: {e}")
+    except Exception as e:
+        log(f"  原页渲染失败（不影响文本流程）：{type(e).__name__}: {e}")
+    return pages_img, pages_txt, pages_txt_meta
+
+
+def _safe_terms(tr, sample):
+    """术语抽取（容错包裹，便于放进线程池并发）。"""
+    try:
+        return tr.extract_terms(sample, limit=30)
+    except Exception as e:
+        log("  术语抽取失败，跳过：", str(e)[:80])
+        return []
+
+
+def _safe_analyze(az, meta, body_text):
+    """创新点分析（容错包裹，便于放进线程池并发）。"""
+    try:
+        return az.analyze(meta, body_text)
+    except Exception as e:
+        log("  分析失败：", str(e)[:100])
+        return None
+
+
 # ---------------- 单篇处理 ----------------
 
 def process_one(rec, llm, tr, az, max_pages=None):
@@ -70,39 +127,7 @@ def process_one(rec, llm, tr, az, max_pages=None):
 
     did = _make_id({"filename": rec["filename"], "path": path})
 
-    # ---- 原页渲染：纯文本抽取会丢掉图/公式/双栏排版，这里整页存 JPG ----
-    pages_img = {}
-    pages_txt = {}
-    pages_txt_meta = {}
-    if PI_ON:
-        try:
-            imgs = render_page_images(
-                path, os.path.join(DATA_DIR, "pages", did),
-                zoom=PI_ZOOM, quality=PI_QUALITY,
-                max_pages=max_pages if max_pages is not None
-                else int(LIM.get("max_pages", 8)))
-            pages_img = {str(p["page"]): os.path.relpath(p["file"], ROOT)
-                         .replace("\\", "/") for p in imgs}
-            if imgs:
-                log(f"  原页图片 {len(imgs)} 张")
-            # ---- 词级文本层：原文分屏「划选 → 翻译」的数据来源 ----
-            if PI_WORDS and imgs:
-                try:
-                    pages_txt, pages_txt_meta = extract_word_boxes(
-                        path, [p["page"] for p in imgs], with_meta=True)
-                    if pages_txt:
-                        n_w = sum(len(v) for v in pages_txt.values())
-                        log(f"  词级文本层 {n_w} 词（划词翻译用）")
-                    for k in ("scanned_pages", "rotated_pages",
-                              "truncated_pages", "no_text_pages"):
-                        if (pages_txt_meta or {}).get(k):
-                            log(f"  页适配 · {k}: {pages_txt_meta[k]}")
-                    if (pages_txt_meta or {}).get("err"):
-                        log(f"  页适配 · 警告: {pages_txt_meta['err']}")
-                except Exception as e:
-                    log(f"  文本层提取失败（不影响其他流程）：{type(e).__name__}: {e}")
-        except Exception as e:
-            log(f"  原页渲染失败（不影响文本流程）：{type(e).__name__}: {e}")
+    # ---- 原页渲染：移到后台线程，与 LLM 调用并行（见下方 fut_img） ----
 
     doc = {
         "title": rec.get("title") or guess_title_from_filename(rec["filename"]),
@@ -124,35 +149,43 @@ def process_one(rec, llm, tr, az, max_pages=None):
     body_blocks = [b for b in blocks if b["kind"] != "formula"]
     log(f"  块数 {len(blocks)}，可译 {len(body_blocks)}，语言 {doc['lang_src']}")
 
-    bilingual, terms = [], []
-    if not is_cn:
-        log("  抽术语 ...")
-        sample = _term_sample(body_blocks,
-                              max_chars=int(LIM.get("max_chars_terms", 6000)))
-        try:
-            terms = tr.extract_terms(sample, limit=30)
-        except LLMError as e:
-            log("  术语抽取失败，跳过：", str(e)[:80])
-        log(f"  翻译 {len(body_blocks)} 段 ...")
+    bilingual, terms, analysis = [], [], None
+    max_pages_render = max_pages if max_pages is not None else int(LIM.get("max_pages", 8))
 
-        def prog(i, n, err=None):
-            log(f"    批次 {i}/{n}" + (f"  [警告] {err}" if err else ""))
-        got = tr.translate_blocks(body_blocks, terms=terms, progress=prog)
-        bilingual = build_bilingual(blocks, got)
-    else:
+    if is_cn:
+        # 中文：无需翻译/术语，仅做创新点分析；页图渲染与之并行
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            fut_img = ex.submit(_render_pages, path, did, max_pages_render)
+            body_text = pick_body_blocks(blocks,
+                                         max_chars=int(LIM.get("max_chars_body", 14000)),
+                                         exclude_abstract=True)
+            analysis = _safe_analyze(az, build_meta(doc), body_text)
+            pages_img, pages_txt, pages_txt_meta = fut_img.result()
         bilingual = [{"idx": b["idx"], "page": b["page"], "kind": b["kind"],
                       "source": b["text"], "target": "",
                       "keep_original": b["kind"] == "formula"} for b in blocks]
+    else:
+        # 英文：术语抽取 与 创新点分析 互不依赖 → 并行；翻译依赖术语，
+        # 等术语回来再并发翻，整段与页图渲染也并行。
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            fut_img = ex.submit(_render_pages, path, did, max_pages_render)
+            sample = _term_sample(body_blocks,
+                                  max_chars=int(LIM.get("max_chars_terms", 6000)))
+            body_text = pick_body_blocks(blocks,
+                                         max_chars=int(LIM.get("max_chars_body", 14000)),
+                                         exclude_abstract=True)
+            meta = build_meta(doc)
+            fut_terms = ex.submit(_safe_terms, tr, sample)
+            fut_az = ex.submit(_safe_analyze, az, meta, body_text)
+            terms = fut_terms.result()      # 等术语 → 才能拼翻译提示词
+            log(f"  翻译 {len(body_blocks)} 段（并发批）...")
 
-    log("  创新点分析 ...")
-    body_text = pick_body_blocks(blocks,
-                                 max_chars=int(LIM.get("max_chars_body", 14000)),
-                                 exclude_abstract=True)
-    analysis = None
-    try:
-        analysis = az.analyze(build_meta(doc), body_text)
-    except LLMError as e:
-        log("  分析失败：", str(e)[:100])
+            def prog(i, n, err=None):
+                log(f"    批次 {i}/{n}" + (f"  [警告] {err}" if err else ""))
+            got = tr.translate_blocks(body_blocks, terms=terms, progress=prog)
+            bilingual = build_bilingual(blocks, got)
+            analysis = fut_az.result()
+            pages_img, pages_txt, pages_txt_meta = fut_img.result()
 
     if not analysis:
         analysis = {"profile": {}, "insights": [], "concepts": []}

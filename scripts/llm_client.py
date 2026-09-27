@@ -39,6 +39,7 @@ import json
 import os
 import re
 import time
+import threading
 import urllib.request
 import urllib.error
 
@@ -261,6 +262,7 @@ class CloudLLM:
         self.retries = retries
         # 调用统计（按 provider 分组）
         self._stats = {}
+        self._lock = threading.Lock()   # 并发调用时保护统计 / 探测写入
         self.json_probe = {}       # pid -> bool，记录 JSON 模式是否可用
 
     # ---------- provider 解析 ----------
@@ -329,13 +331,14 @@ class CloudLLM:
         }
 
     def _bump(self, pid, ci, co, err=False):
-        d = self._stats.setdefault(pid, {"calls": 0, "chars_in": 0,
-                                         "chars_out": 0, "errors": 0})
-        d["calls"] += 1
-        d["chars_in"] += ci
-        d["chars_out"] += co
-        if err:
-            d["errors"] += 1
+        with self._lock:
+            d = self._stats.setdefault(pid, {"calls": 0, "chars_in": 0,
+                                             "chars_out": 0, "errors": 0})
+            d["calls"] += 1
+            d["chars_in"] += ci
+            d["chars_out"] += co
+            if err:
+                d["errors"] += 1
 
     # ---------- URL 拼装 ----------
     @staticmethod
@@ -468,9 +471,11 @@ class CloudLLM:
                     self._bump(p.get("id"), sum(len(m) for m in [str(prompt), str(system or "")]),
                                len(txt or ""))
                     if json_mode and not drop_json and txt:
-                        self.json_probe[p.get("id")] = True
+                        with self._lock:
+                            self.json_probe[p.get("id")] = True
                     if json_mode and drop_json:
-                        self.json_probe[p.get("id")] = False
+                        with self._lock:
+                            self.json_probe[p.get("id")] = False
                     return (txt or "").strip()
                 except urllib.error.HTTPError as e:
                     detail = ""
