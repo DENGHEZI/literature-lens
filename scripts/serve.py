@@ -57,17 +57,21 @@ _TASKS_LOCK = threading.Lock()
 _DATA_LOCK = threading.Lock()
 
 # ---------------- 翻译缓存（省 Token 的第一道闸） ----------------
-_ROOT = os.path.dirname(HERE)
-_TR_PATH = os.path.join(_ROOT, "data", "translate_cache.json")
+# 注意：翻译缓存也收进 LENS_DATA_DIR（持久卷），否则 CFS 挂载后
+# 多实例各自一份缓存、命中率骤降且可能不一致。
 _TR_CACHE = {}
 _TR_LOCK = threading.Lock()
+
+
+def _tr_cache_path():
+    return os.path.join(_base_root(), "translate_cache.json")
 
 
 def _load_tr_cache():
     if _TR_CACHE:
         return
     try:
-        with open(_TR_PATH, encoding="utf-8") as f:
+        with open(_tr_cache_path(), encoding="utf-8") as f:
             d = json.load(f)
             if isinstance(d, dict):
                 _TR_CACHE.update(d)
@@ -94,8 +98,8 @@ def _tr_put(key, val):
             if len(_TR_CACHE) > 6000:          # 防膨胀：超过 6000 条时丢弃最早的 1000 条
                 for k in list(_TR_CACHE)[:1000]:
                     _TR_CACHE.pop(k, None)
-            os.makedirs(os.path.dirname(_TR_PATH), exist_ok=True)
-            with open(_TR_PATH, "w", encoding="utf-8") as f:
+            os.makedirs(_base_root(), exist_ok=True)
+            with open(_tr_cache_path(), "w", encoding="utf-8") as f:
                 json.dump(_TR_CACHE, f, ensure_ascii=False)
         except Exception:
             pass
@@ -585,7 +589,9 @@ def _ctx_paths(oid):
     root = os.path.dirname(HERE)
     base = _base_root()
     g_data = os.environ.get("LENS_DATA") or os.path.join(base, "lens_data.json")
-    g_up = os.path.join(root, "uploads")
+    # 全局/公共上下文的上传目录也必须收进 LENS_DATA_DIR（持久卷），否则 CFS 挂载后
+    # 各实例的上传 PDF 互不可见，解析线程在另一实例上找不到文件 → 任务永远卡 queued。
+    g_up = os.path.join(base, "uploads")
     g_cfg = os.path.join(root, "config.user.json")
     if not oid:
         return {"oid": "", "data": g_data, "upload": g_up, "config": g_cfg}
@@ -681,14 +687,84 @@ def load(data_path, html_path=None, cfg=None):
     if html_path and os.path.exists(html_path):
         STATE["html"] = open(html_path, encoding="utf-8").read()
     upload_cfg = cfg.get("uploads") or {}
-    STATE["upload_dir"] = os.path.abspath(upload_cfg.get("dir") or
-                                            os.path.join(os.path.dirname(HERE), "uploads"))
+    # 部署挂卷优先：一旦设了 LENS_DATA_DIR/LENS_DATA_ROOT，上传目录强制收进
+    # 持久卷（<卷>/uploads），忽略 config.json 里可能写死的绝对路径。否则多实例
+    # / 实例回收时，上传的 PDF 落在容器本地盘，解析线程在别的实例上找不到文件，
+    # 任务永远卡 queued —— 这正是线上「上传后十几分钟没结果」的根因之一。
+    _data_root = os.environ.get("LENS_DATA_ROOT") or os.environ.get("LENS_DATA_DIR")
+    if _data_root:
+        STATE["upload_dir"] = os.path.abspath(os.path.join(_base_root(), "uploads"))
+    else:
+        STATE["upload_dir"] = os.path.abspath(upload_cfg.get("dir") or
+                                                os.path.join(_base_root(), "uploads"))
     os.makedirs(STATE["upload_dir"], exist_ok=True)
+
+
+def _tasks_file():
+    """任务表落盘文件：与文献库/上传同处 LENS_DATA_DIR（持久卷），
+    挂载 CFS 后多实例可读同一份，实例回收重启也能续跑未完成任务。"""
+    return os.path.join(_base_root(), "tasks.json")
+
+
+def _save_tasks():
+    """把内存任务表原子落盘（TASKS 改动后调用；自带锁，调用方无需持锁）。"""
+    try:
+        with _TASKS_LOCK:
+            snap = {k: dict(v) for k, v in TASKS.items()}
+        os.makedirs(_base_root(), exist_ok=True)
+        tmp = _tasks_file() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snap, f, ensure_ascii=False)
+        os.replace(tmp, _tasks_file())
+    except Exception:
+        pass
+
+
+def _load_tasks():
+    """启动时从磁盘恢复任务表（不重启任何任务，只把记录读回内存）。"""
+    try:
+        p = _tasks_file()
+        if not os.path.exists(p):
+            return
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            with _TASKS_LOCK:
+                TASKS.update(d)
+    except Exception:
+        pass
+
+
+def _heal_tasks():
+    """实例重启/回收后自修复：把上次停在 queued/running 的任务重新拉起。
+
+    仅当后端挂了 CFS 持久卷、且上传 PDF 仍在盘上时才真能续跑；否则任务会
+    因找不到文件而以 error 结束（总比永远卡 queued 强）。
+    """
+    with _TASKS_LOCK:
+        pending = [(tid, dict(t)) for tid, t in TASKS.items()
+                   if t.get("status") in ("queued", "running")]
+    for tid, t in pending:
+        _set_task(tid, status="queued", stage="实例重启，重新排队…")
+        if t.get("upload_id"):
+            threading.Thread(
+                target=_analyze_worker,
+                args=(tid, t.get("upload_id"), t.get("filename") or "",
+                      t.get("llm_cfg"), t.get("uid") or ""),
+                daemon=True,
+            ).start()
+        elif t.get("action"):
+            threading.Thread(
+                target=_llm_worker,
+                args=(tid, t.get("action"), t.get("payload") or {}, t.get("uid") or ""),
+                daemon=True,
+            ).start()
 
 
 def _set_task(task_id, **kw):
     with _TASKS_LOCK:
         TASKS.setdefault(task_id, {}).update(kw)
+    _save_tasks()
 
 
 def _task_visible(task, oid):
@@ -700,11 +776,12 @@ def _task_visible(task, oid):
     return owner == (oid or "")
 
 
-def _analyze_worker(task_id, upload_id, filename, llm_cfg=None, oid=""):
-    """后台解析上传的 PDF：抽取 → 术语 → 批量翻译 → 创新点分析 → 写入文献库。
+def _analyze_core(task_id, upload_id, filename, llm_cfg=None, oid=""):
+    """解析上传的 PDF：抽取 → 术语 → 批量翻译 → 创新点分析 → 写入文献库。
 
-    复用主流水线（pipeline.process_one），与离线批量分析产出同一套数据结构，
-    因此前端速览卡 / 译文 / 原文页 / 创新点 / 知识点全部立即生效。
+    返回生成好的 doc（含译文/创新点）；出错或未配置模型时返回 None，
+    错误详情已写入任务表。既供后台线程（_analyze_worker）调用，
+    也供单请求同步端点（/api/translate-sync）直接复用，避免重复实现。
     oid：该任务所属用户 —— 线程内先把 STATE 切到他的上下文，避免并发串库。
     """
     def set_task(**kw):
@@ -778,12 +855,19 @@ def _analyze_worker(task_id, upload_id, filename, llm_cfg=None, oid=""):
                 _render.render(ctx["data_path"], hp)
         except Exception:
             pass
+        return doc
     except Exception as e:
         msg = f"{type(e).__name__}: {e}"[:260]
         low = msg.lower()
         if "401" in msg or "api key" in low or "unauthorized" in low or "authentication" in low:
             msg += " ｜ 提示：请先到「设置 → API」粘贴有效 Key，点「测试连接」确认后再上传"
         set_task(status="error", stage="解析失败", error=msg)
+        return None
+
+
+def _analyze_worker(task_id, upload_id, filename, llm_cfg=None, oid=""):
+    """后台线程版：直接调用核心逻辑（结果已写入任务表，无需返回值）。"""
+    _analyze_core(task_id, upload_id, filename, llm_cfg, oid)
 
 
 def _ctx_state(oid):
@@ -1876,6 +1960,56 @@ class Handler(BaseHTTPRequestHandler):
             ).start()
             self._send(200, {"ok": True, "task": task_id})
             return
+        if p == "/api/translate-sync":
+            # 单请求内完成 上传→抽取→翻译→创新点分析→返回 doc。
+            # 专为「多实例 + 无共享存储」部署下后台线程+轮询卡死而设：
+            # 整个流程在同一请求、同一实例内跑完，天然不受跨实例轮询影响，
+            # 也无需依赖任务表落盘。适合公网域名 / 本地网页 / 小程序直连公网域名
+            # （这些路径没有 callContainer ≤15s 单请求上限）；callContainer 内整篇
+            # 翻译可能超时，仍建议走 analyze-pdf + 轮询（需配 CFS + 单实例）。
+            req = self._read_json(max_bytes=30 * 1024 * 1024)
+            if req is None:
+                return
+            filename = (req.get("filename") or "upload.pdf").strip()
+            llm_cfg = req.get("llm") or None
+            upload_id = (req.get("upload_id") or "").strip()
+            file_data = req.get("file_data") or None
+            # 可选：直接带 base64 文件，本请求内落盘（与上传共用目录，页图找回一致）
+            if file_data:
+                try:
+                    raw = base64.b64decode(file_data)
+                except Exception as e:
+                    self._send(400, {"ok": False, "error": f"file_data 解码失败：{e}"})
+                    return
+                upload_id = uuid.uuid4().hex
+                pdf_path = os.path.join(STATE["upload_dir"], upload_id + ".pdf")
+                os.makedirs(STATE["upload_dir"], exist_ok=True)
+                with open(pdf_path, "wb") as f:
+                    f.write(raw)
+            if not re.fullmatch(r"[0-9a-f]{32}", upload_id):
+                self._send(400, {"ok": False, "error": "缺少有效的 upload_id 或 file_data"})
+                return
+            pdf_path = os.path.join(STATE["upload_dir"], upload_id + ".pdf")
+            if not os.path.isfile(pdf_path):
+                self._send(404, {"ok": False, "error": "上传文件已过期或不存在，请重新上传"})
+                return
+            task_id = uuid.uuid4().hex
+            _set_task(task_id, status="running", stage="正在解析…",
+                      upload_id=upload_id, filename=filename, uid=oid,
+                      created_at=int(time.time()))
+            try:
+                doc = _analyze_core(task_id, upload_id, filename, llm_cfg, oid)
+            except Exception:
+                doc = None
+            with _TASKS_LOCK:
+                t = dict(TASKS.get(task_id) or {})
+            if doc is None:
+                self._send(200, {"ok": False,
+                                 "error": t.get("error") or "解析失败（未知原因）",
+                                 "task": task_id, "stage": t.get("stage")})
+                return
+            self._send(200, {"ok": True, "task": task_id, "doc": t.get("doc") or doc})
+            return
         if p == "/api/reanalyze":
             # 重新解析已有文献：重跑 翻译 + 速览/创新点（Key 失效后补救 / 拖拽触发分析）
             if self._llm_required():
@@ -2247,6 +2381,14 @@ def main():
     print("=" * 60)
     if a.open:
         webbrowser.open(url)
+    # 启动自修复：恢复上次落盘的任务表，并把停在 queued/running 的未完成任务
+    # 重新拉起（依赖 CFS 持久卷才会真续跑；否则会因缺文件而以 error 结束）。
+    # 放在 serve_forever 之前、上下文已就绪之后。
+    try:
+        _load_tasks()
+        _heal_tasks()
+    except Exception as e:
+        print("任务自修复异常（已忽略）：", e)
     # 多线程：页图渲染/大文件传输不再阻塞其他 API（原单线程 HTTPServer 会被
     # fitz 渲染卡住数秒，是小程序页图「加载中…」过慢的主因之一）
     ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
