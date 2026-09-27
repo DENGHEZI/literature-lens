@@ -25,3 +25,12 @@ __pycache__/
 .venv/
 venv/
 env/
+
+# ---------------- 开发期调试脚本 / 中间产物（不属产品代码） ----------------
+scripts/debug_*.js
+scripts/diag_*.js
+scripts/verify_*.js
+scripts/*_out.json
+_test_*.py
+_test*.py
+_*.log
