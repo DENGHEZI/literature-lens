@@ -19,6 +19,7 @@
 import os
 import sys
 import json
+import shutil
 import hashlib
 import argparse
 import threading
@@ -543,15 +544,24 @@ def _openid_from(self, req=None):
     取不到时返回空串 → 调用方回退到「公共上下文」（现网体验版照旧可用）。
     """
     cand = ""
-    for h in ("x-wechat-openid", "x-wx-openid", "x-lens-uid", "uid"):
+    # ⚠️ 优先级：x-lens-uid 必须在 x-wx-openid 之前。
+    # 原因：x-lens-uid 由前端在「每一次请求」都显式携带（存在本地 storage，稳定不变），
+    # 而 x-wx-openid 只有走 callContainer（云托管内网）时才会被微信网关注入；
+    # 一旦某个请求走了别的通道（如公网域名直连、或本地网页调试），就拿不到 openid。
+    # 若让 openid 优先，同一个用户的上传（走 callContainer，有 openid）与
+    # 列表查询（走直连，无 openid）会落到 users/<openid>/ 与 users/<uid>/ 两个不同库，
+    # 表现为「提示解析完成，但文献列表里什么都没有」——数据没丢，只是读到了另一个库。
+    # 统一以「前端稳定 uid」作为首选身份，可保证所有通道落到同一个库。
+    for h in ("x-lens-uid", "uid", "x-wechat-openid", "x-wx-openid"):
         v = (self.headers.get(h) or "").strip()
-        if v:
+        if v and _safe_oid(v):
             cand = v
             break
     if not cand and isinstance(req, dict):
-        for k in ("openid", "uid", "_uid"):
+        # 同理：uid 优先于 openid，保证与请求头策略一致
+        for k in ("uid", "_uid", "openid"):
             v = str(req.get(k) or "").strip()
-            if v:
+            if v and _safe_oid(v):
                 cand = v
                 break
     if not cand:
@@ -615,10 +625,95 @@ def _ensure_user_data(paths):
     return paths["data"]
 
 
+def _adopt_orphan_docs(oid):
+    """把「因身份不统一而落到别的库」的文献并回当前用户库（一次性自愈）。
+
+    背景：早期版本服务端优先用 x-wx-openid（只有 callContainer 才有），
+    而前端上传与列表若走了不同通道，会分别落到 users/<openid>/ 与 users/<uid>/。
+    用户看到的现象是「提示解析完成，但列表里什么都没有」——数据其实没丢。
+
+    自愈策略（保守、只增不减）：
+      · 当前用户库为空（0 篇）时才触发，避免误并；
+      · 只合并 users/<其他id>/lens_data.json 里、当前库中不存在的 doc；
+      · 同时把对应 PDF 复制进当前用户 uploads/，保证解析/阅读可用；
+      · 不删除源库，避免误伤（源库可由用户后续自行清理）。
+    """
+    if not oid:
+        return 0
+    try:
+        base = _base_root()
+        users_dir = os.path.join(base, "users")
+        if not os.path.isdir(users_dir):
+            return 0
+        mine_path = os.path.join(users_dir, oid, "lens_data.json")
+        if not os.path.isfile(mine_path):
+            return 0
+        with open(mine_path, encoding="utf-8") as f:
+            mine = json.load(f)
+        have = mine.get("docs") or []
+        if have:                                    # 自己库里有东西 -> 不并
+            return 0
+        merged = []
+        seen = set()
+        for name in os.listdir(users_dir):
+            if name == oid:
+                continue
+            other = os.path.join(users_dir, name, "lens_data.json")
+            if not os.path.isfile(other):
+                continue
+            try:
+                with open(other, encoding="utf-8") as f:
+                    od = json.load(f)
+            except Exception:
+                continue
+            for d in (od.get("docs") or []):
+                did = d.get("id")
+                if not did or did in seen:
+                    continue
+                seen.add(did)
+                merged.append(d)
+                # 顺带把 PDF 带过来，保证后续能解析/阅读
+                src = os.path.join(users_dir, name, "uploads", str(did) + ".pdf")
+                dst_dir = os.path.join(users_dir, oid, "uploads")
+                dst = os.path.join(dst_dir, str(did) + ".pdf")
+                if os.path.isfile(src) and not os.path.exists(dst):
+                    try:
+                        os.makedirs(dst_dir, exist_ok=True)
+                        shutil.copy2(src, dst)
+                    except Exception:
+                        pass
+                up_id = (d.get("meta") or {}).get("upload_id")
+                if up_id:
+                    s2 = os.path.join(users_dir, name, "uploads", str(up_id) + ".pdf")
+                    d2 = os.path.join(dst_dir, str(up_id) + ".pdf")
+                    if os.path.isfile(s2) and not os.path.exists(d2):
+                        try:
+                            os.makedirs(dst_dir, exist_ok=True)
+                            shutil.copy2(s2, d2)
+                        except Exception:
+                            pass
+        if not merged:
+            return 0
+        mine["docs"] = merged
+        tmp = mine_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(mine, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, mine_path)
+        print(f"[heal] 已为 {oid} 并回 {len(merged)} 篇（来自其它身份目录的孤儿数据）")
+        return len(merged)
+    except Exception as e:
+        print("[heal] adopt 失败：", e)
+        return 0
+
+
 def _build_ctx(oid):
     """为一个 openid 构建（或复用）隔离上下文并载入其文献库与 API 配置。"""
     paths = _ctx_paths(oid)
     _ensure_user_data(paths)
+    try:                                    # 身份不统一导致的历史孤儿数据自愈
+        _adopt_orphan_docs(oid)
+    except Exception:
+        pass
     data_path = paths["data"]
     cfg = load_config(extra=[paths["config"]], require_provider=False,
                       skip_global_user=True)
