@@ -55,6 +55,9 @@ _USERS_LOCK = threading.RLock()
 TASKS = {}
 _TASKS_LOCK = threading.Lock()
 _DATA_LOCK = threading.Lock()
+# 当前「生效上下文」的 openid（跨线程共享会有竞争，但仅用于同步端点的归属标记，
+# 且 _use_user 在每次请求进入时立即刷新，同步端点内不存在并发切换）。
+_STATE_OID = [""]
 
 # ---------------- 翻译缓存（省 Token 的第一道闸） ----------------
 # 注意：翻译缓存也收进 LENS_DATA_DIR（持久卷），否则 CFS 挂载后
@@ -776,7 +779,13 @@ def _task_visible(task, oid):
     return owner == (oid or "")
 
 
-def _analyze_core(task_id, upload_id, filename, llm_cfg=None, oid=""):
+def _current_oid():
+    """当前「生效上下文」的 openid（由 _ctx_state 维护，供同步端点取归属）。"""
+    return _STATE_OID[0]
+
+
+def _analyze_core(task_id, upload_id, filename, llm_cfg=None, oid="",
+                  timeout=None, max_pages=None):
     """解析上传的 PDF：抽取 → 术语 → 批量翻译 → 创新点分析 → 写入文献库。
 
     返回生成好的 doc（含译文/创新点）；出错或未配置模型时返回 None，
@@ -786,16 +795,19 @@ def _analyze_core(task_id, upload_id, filename, llm_cfg=None, oid=""):
     """
     def set_task(**kw):
         _set_task(task_id, **kw)
-    ctx = _user_ctx(oid)
     try:
+        # 关键：_user_ctx / _ctx_state 也必须放进 try。否则一旦用户上下文构建
+        # （读配置/建库）失败，线程会在第一行抛出而无人捕获，任务永远停在
+        # queued（线上「一直排队中、从不 running」的真凶）。
+        ctx = _user_ctx(oid)
         from pipeline import process_one
         from translator import Translator
         import concurrent.futures as _cf
         _ctx_state(oid)                    # 线程内切到该用户，后续写入互不干扰
+        set_task(status="running", stage="正在抽取正文与原页图…")
         pdf_path = os.path.join(ctx["upload_dir"], upload_id + ".pdf")
         if not os.path.isfile(pdf_path):
             raise FileNotFoundError("上传文件已不存在，请重新上传")
-        set_task(status="running", stage="正在抽取正文与原页图…")
         rec = {"filename": filename, "path": pdf_path}
         llm = ctx["llm"]
         # 优先用前端（手机）随请求传来的临时 Key；否则回退该用户已保存的配置。
@@ -815,9 +827,15 @@ def _analyze_core(task_id, upload_id, filename, llm_cfg=None, oid=""):
         # 整体解析超时保护：避免任何异常（典型如模型服务出网挂起）让任务永远
         # 停在 running。超时立即标记失败，前端不再无限转圈。可用环境变量
         # LENS_ANALYZE_TIMEOUT（秒）调整上限。
+        # 内联（单请求）模式下由 _analyze_inline 传入更短的预算，防止请求被
+        # 网关/客户端判超时；后台轮询模式仍用默认 180s。
         _analyze_timeout = int(os.environ.get("LENS_ANALYZE_TIMEOUT", "180"))
+        if timeout is not None:
+            _analyze_timeout = int(timeout)
+        # 内联模式可指定页数上限，页数越少翻译越快（默认沿用流水线 8 页）。
+        _mp = max_pages if max_pages is not None else 8
         with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-            _fut = _ex.submit(process_one, rec, llm, tr, az, max_pages=8)
+            _fut = _ex.submit(process_one, rec, llm, tr, az, max_pages=_mp)
             try:
                 doc = _fut.result(timeout=_analyze_timeout)
             except _cf.TimeoutError:
@@ -866,18 +884,25 @@ def _analyze_core(task_id, upload_id, filename, llm_cfg=None, oid=""):
 
 
 def _analyze_worker(task_id, upload_id, filename, llm_cfg=None, oid=""):
-    """后台线程版：直接调用核心逻辑（结果已写入任务表，无需返回值）。"""
-    _analyze_core(task_id, upload_id, filename, llm_cfg, oid)
+    """后台线程版：包一层兜底，任何异常都写回任务表（绝不静默卡 queued）。"""
+    try:
+        _analyze_core(task_id, upload_id, filename, llm_cfg, oid)
+    except BaseException as e:                      # noqa: BLE001 —— 线程兜底必须全捕
+        try:
+            _set_task(task_id, status="error", stage="解析失败",
+                      error=f"后台线程异常：{type(e).__name__}: {e}"[:260])
+        except Exception:
+            pass
 
 
 def _ctx_state(oid):
     """在线程内把 STATE 切到指定用户的上下文（供后台任务复用既有工具函数）。
-
     这是隔离生效的关键一步：所有既有工具函数（_resolve_upload_pdf / _page_image /
     _relevant_ctx / _llm_required …）都读 STATE，所以必须把 STATE 换成该用户自己的
     cfg / 库 / LLM，之后它们才会作用于正确的人。
     """
     ctx = _user_ctx(oid)
+    _STATE_OID[0] = oid or ""
     STATE.update({
         "cfg": ctx["cfg"], "data_path": ctx["data_path"], "data": ctx["data"],
         "doc_index": ctx["doc_index"], "llm": ctx["llm"], "az": ctx["az"],
@@ -1550,7 +1575,45 @@ class Handler(BaseHTTPRequestHandler):
         meta = self._save_pdf_bytes(pdf, req.get("filename"))
         if meta:
             meta["url"] = "/uploads/" + meta["id"] + ".pdf"
+            # 关键（免共享存储的单请求闭环）：最后一块可要求「顺带解析」。
+            # 这样上传与解析发生在同一请求、同一实例内，彻底绕开
+            # 「多实例 + 无 CFS → 文件在别的实例读不到 / 后台线程被平台杀掉」
+            # 导致的解析卡死。需在最后一块带 analyze:true（+ llm 临时配置）。
+            if req.get("analyze"):
+                self._send(200, self._analyze_inline(
+                    meta["id"], req.get("filename") or "", req.get("llm") or None))
+                return
             self._send(200, {"ok": True, "upload": meta})
+
+    def _analyze_inline(self, upload_id, filename, llm_cfg=None):
+        """在同一请求内跑完 抽取→翻译→创新点→入库，返回 doc。
+
+        与后台版 _analyze_core 共用实现；这里同步执行并直接返回结果，
+        不做任务表轮询。请求方需自行容忍较长耗时（本地实测约 8-15s）。
+        """
+        task_id = uuid.uuid4().hex
+        _set_task(task_id, status="running", stage="正在解析…",
+                  upload_id=upload_id, filename=filename, uid=_current_oid(),
+                  created_at=int(time.time()))
+        # 内联预算：默认 40s（本地实测 3 页约 8s、8 页约 15s，留足余量）。
+        # 通过环境变量 LENS_INLINE_TIMEOUT 可调；callContainer 端需把超时
+        # 设为 ≥ 该值（小程序已放宽到 60s）。
+        _budget = int(os.environ.get("LENS_INLINE_TIMEOUT", "40"))
+        try:
+            doc = _analyze_core(task_id, upload_id, filename, llm_cfg, _current_oid(),
+                                timeout=_budget)
+        except Exception as e:
+            with _TASKS_LOCK:
+                t = dict(TASKS.get(task_id) or {})
+            return {"ok": False, "task": task_id, "stage": t.get("stage"),
+                    "error": f"{type(e).__name__}: {e}"[:260]}
+        with _TASKS_LOCK:
+            t = dict(TASKS.get(task_id) or {})
+        if doc is None:
+            return {"ok": False, "task": task_id, "stage": t.get("stage"),
+                    "error": t.get("error") or "解析失败（未知原因）"}
+        return {"ok": True, "task": task_id, "upload_id": upload_id,
+                "doc": t.get("doc") or doc}
 
     def _llm_required(self):
         """未配置任何 AI 模型时，回 200 ok:False 并 return True（已处理）。
