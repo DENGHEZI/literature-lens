@@ -48,9 +48,10 @@ STATE = {"data": None, "llm": None, "az": None, "html": "",
 # ---------------- 多租户隔离（微信 openid → 各自独立的数据 / API / 上传） ----------------
 # STATE 始终指向「当前生效的租户上下文」，供既有的全局工具函数（_resolve_upload_pdf /
 # _page_image / _relevant_ctx 等）零改动复用；每个请求进入时用 _use_user() 切换。
-_PUBLIC = None                  # 无 openid 的匿名/公共上下文（本地网页、体验版旧链路）
 _USERS = {}                     # openid → 上下文 dict
 _USERS_LOCK = threading.RLock()
+# 注：v2 起已移除「匿名共享上下文」。拿不到微信 openid 的请求不再落到任何
+# 共享库，而是被 _need_identity 直接拒绝（401）—— 隐私优先。
 
 # 上传解析任务表 + 数据文件写锁
 TASKS = {}
@@ -535,44 +536,40 @@ def _safe_oid(raw):
 
 
 def _openid_from(self, req=None):
-    """从请求里取微信 openid（云托管网关注入的头优先）。
+    """从请求里取「微信用户唯一标识」——只认 openid，绝不接受前端自报的 uid。
 
-    优先级：
-      1. x-wechat-openid / x-wx-openid  —— 云托管 callContainer 网关自动注入（可信、免前端传）
-      2. x-lens-uid / uid               —— 前端显式携带的稳定用户标识（自建/兜底）
-      3. req.openid / req.uid / query uid —— 本地自测方便
-    取不到时返回空串 → 调用方回退到「公共上下文」（现网体验版照旧可用）。
+    ⚠️ 安全前提（多租户隔离的唯一依据）：
+      身份**只能**来自微信网关，因为只有它不可被前端伪造。
+        · 走 callContainer 时，微信网关注入 `X-WX-OPENID`（可信、免前端传）；
+        · 走公网直连时可带 `X-WX-OPENID`，但该值必须先由前端经
+          wx.login → 后端 code2Session 换取，绝不能前端自己编。
+      历史上曾把「前端本地随机 uid」当作身份，那是**严重漏洞**：
+        · 同一台设备/同一微信号换地方登录时，本地 storage 里的 uid 不变，
+          于是新用户会直接看到上一个用户的文献库与其 API Key；
+        · 换设备又会变，导致自己看不到自己的数据。
+      因此 v2 起**彻底不再把 x-lens-uid / uid 当作身份**（仅保留为遥测字段，不参与隔离）。
+
+    取不到 openid → 返回空串，调用方回退到「公共只读上下文」，
+    该上下文**不持久化任何用户数据**，避免把匿名请求写进别人的库。
     """
-    cand = ""
-    # ⚠️ 优先级：x-lens-uid 必须在 x-wx-openid 之前。
-    # 原因：x-lens-uid 由前端在「每一次请求」都显式携带（存在本地 storage，稳定不变），
-    # 而 x-wx-openid 只有走 callContainer（云托管内网）时才会被微信网关注入；
-    # 一旦某个请求走了别的通道（如公网域名直连、或本地网页调试），就拿不到 openid。
-    # 若让 openid 优先，同一个用户的上传（走 callContainer，有 openid）与
-    # 列表查询（走直连，无 openid）会落到 users/<openid>/ 与 users/<uid>/ 两个不同库，
-    # 表现为「提示解析完成，但文献列表里什么都没有」——数据没丢，只是读到了另一个库。
-    # 统一以「前端稳定 uid」作为首选身份，可保证所有通道落到同一个库。
-    for h in ("x-lens-uid", "uid", "x-wechat-openid", "x-wx-openid"):
+    # 只认微信网关注入的 openid 头（两种命名都兼容）
+    for h in ("x-wx-openid", "x-wechat-openid"):
         v = (self.headers.get(h) or "").strip()
         if v and _safe_oid(v):
-            cand = v
-            break
-    if not cand and isinstance(req, dict):
-        # 同理：uid 优先于 openid，保证与请求头策略一致
-        for k in ("uid", "_uid", "openid"):
-            v = str(req.get(k) or "").strip()
-            if v and _safe_oid(v):
-                cand = v
-                break
-    if not cand:
-        try:
-            q = urlparse(self.path).query or ""
-            m = re.search(r"(?:^|&)uid=([A-Za-z0-9_-]{8,64})", q)
-            if m:
-                cand = m.group(1)
-        except Exception:
-            pass
-    return _safe_oid(cand)
+            return _safe_oid(v)
+    # 请求体/查询串里的 openid 仅用于本地自测；uid 一律不作为身份
+    if isinstance(req, dict):
+        v = str(req.get("openid") or "").strip()
+        if v and _safe_oid(v):
+            return _safe_oid(v)
+    try:
+        q = urlparse(self.path).query or ""
+        m = re.search(r"(?:^|&)openid=([A-Za-z0-9_-]{8,64})", q)
+        if m:
+            return _safe_oid(m.group(1))
+    except Exception:
+        pass
+    return ""
 
 
 def _base_root():
@@ -625,95 +622,10 @@ def _ensure_user_data(paths):
     return paths["data"]
 
 
-def _adopt_orphan_docs(oid):
-    """把「因身份不统一而落到别的库」的文献并回当前用户库（一次性自愈）。
-
-    背景：早期版本服务端优先用 x-wx-openid（只有 callContainer 才有），
-    而前端上传与列表若走了不同通道，会分别落到 users/<openid>/ 与 users/<uid>/。
-    用户看到的现象是「提示解析完成，但列表里什么都没有」——数据其实没丢。
-
-    自愈策略（保守、只增不减）：
-      · 当前用户库为空（0 篇）时才触发，避免误并；
-      · 只合并 users/<其他id>/lens_data.json 里、当前库中不存在的 doc；
-      · 同时把对应 PDF 复制进当前用户 uploads/，保证解析/阅读可用；
-      · 不删除源库，避免误伤（源库可由用户后续自行清理）。
-    """
-    if not oid:
-        return 0
-    try:
-        base = _base_root()
-        users_dir = os.path.join(base, "users")
-        if not os.path.isdir(users_dir):
-            return 0
-        mine_path = os.path.join(users_dir, oid, "lens_data.json")
-        if not os.path.isfile(mine_path):
-            return 0
-        with open(mine_path, encoding="utf-8") as f:
-            mine = json.load(f)
-        have = mine.get("docs") or []
-        if have:                                    # 自己库里有东西 -> 不并
-            return 0
-        merged = []
-        seen = set()
-        for name in os.listdir(users_dir):
-            if name == oid:
-                continue
-            other = os.path.join(users_dir, name, "lens_data.json")
-            if not os.path.isfile(other):
-                continue
-            try:
-                with open(other, encoding="utf-8") as f:
-                    od = json.load(f)
-            except Exception:
-                continue
-            for d in (od.get("docs") or []):
-                did = d.get("id")
-                if not did or did in seen:
-                    continue
-                seen.add(did)
-                merged.append(d)
-                # 顺带把 PDF 带过来，保证后续能解析/阅读
-                src = os.path.join(users_dir, name, "uploads", str(did) + ".pdf")
-                dst_dir = os.path.join(users_dir, oid, "uploads")
-                dst = os.path.join(dst_dir, str(did) + ".pdf")
-                if os.path.isfile(src) and not os.path.exists(dst):
-                    try:
-                        os.makedirs(dst_dir, exist_ok=True)
-                        shutil.copy2(src, dst)
-                    except Exception:
-                        pass
-                up_id = (d.get("meta") or {}).get("upload_id")
-                if up_id:
-                    s2 = os.path.join(users_dir, name, "uploads", str(up_id) + ".pdf")
-                    d2 = os.path.join(dst_dir, str(up_id) + ".pdf")
-                    if os.path.isfile(s2) and not os.path.exists(d2):
-                        try:
-                            os.makedirs(dst_dir, exist_ok=True)
-                            shutil.copy2(s2, d2)
-                        except Exception:
-                            pass
-        if not merged:
-            return 0
-        mine["docs"] = merged
-        tmp = mine_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(mine, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, mine_path)
-        print(f"[heal] 已为 {oid} 并回 {len(merged)} 篇（来自其它身份目录的孤儿数据）")
-        return len(merged)
-    except Exception as e:
-        print("[heal] adopt 失败：", e)
-        return 0
-
-
 def _build_ctx(oid):
     """为一个 openid 构建（或复用）隔离上下文并载入其文献库与 API 配置。"""
     paths = _ctx_paths(oid)
     _ensure_user_data(paths)
-    try:                                    # 身份不统一导致的历史孤儿数据自愈
-        _adopt_orphan_docs(oid)
-    except Exception:
-        pass
     data_path = paths["data"]
     cfg = load_config(extra=[paths["config"]], require_provider=False,
                       skip_global_user=True)
@@ -740,11 +652,8 @@ def _build_ctx(oid):
 def _user_ctx(oid):
     """取（或首次创建）某 openid 的上下文；oid 为空 → 公共上下文。"""
     if not oid:
-        global _PUBLIC
-        with _USERS_LOCK:
-            if _PUBLIC is None:
-                _PUBLIC = _build_ctx("")
-            return _PUBLIC
+        # ⚠️ v2：不再为匿名请求建共享上下文（隐私）。调用方须先过 _need_identity。
+        return None
     with _USERS_LOCK:
         ctx = _USERS.get(oid)
         if ctx is None:
@@ -764,13 +673,36 @@ def _use_user(self, req=None):
     """每个请求入口调用：按 openid 把 STATE 切到该用户自己的上下文。
 
     返回 (oid, ctx)。此后所有走 STATE 的既有工具函数自动作用于该用户，
-    互不串库、互不串 Key。无 openid 时切到公共上下文（现网体验版零回归）。
+    互不串库、互不串 Key。
+
+    ⚠️ 隐私铁律 v2：oid 为空（拿不到微信 openid）时，**不再回退到共享的公共库**。
+    旧逻辑会让所有匿名请求共用同一个 _PUBLIC 上下文 —— 那意味着后来者能看到
+    前一个人的文献库与其 API Key，是严重隐私漏洞。现在空 oid 只是「无上下文」，
+    由各写接口自行返回 401（见 _need_identity）。
     """
     oid = _openid_from(self, req)
+    ctx = _user_ctx(oid) if oid else None
+    _ctx_state(oid)
+    if ctx is not None:
+        os.makedirs(STATE["upload_dir"], exist_ok=True)
+    return oid, ctx
+
+
+def _need_identity(self, req=None):
+    """写操作的统一身份闸门：拿不到微信 openid 直接 401，绝不落公共库。
+
+    返回 (ok, oid, ctx)。ok=False 时调用方应立即 return（响应已发出）。
+    """
+    oid = _openid_from(self, req)
+    if not oid:
+        self._send(401, {"ok": False,
+                         "error": "未识别到微信用户身份（缺少 X-WX-OPENID）。"
+                                  "请在小程序内使用；为保护隐私，服务端拒绝受理匿名请求。"})
+        return False, "", None
     ctx = _user_ctx(oid)
     _ctx_state(oid)
     os.makedirs(STATE["upload_dir"], exist_ok=True)
-    return oid, ctx
+    return True, oid, ctx
 
 
 def load(data_path, html_path=None, cfg=None):
@@ -999,6 +931,11 @@ def _ctx_state(oid):
     cfg / 库 / LLM，之后它们才会作用于正确的人。
     """
     ctx = _user_ctx(oid)
+    if ctx is None:
+        # 空 oid（匿名）→ 不做任何上下文切换，保持上一次状态即可；
+        # 调用方（_need_identity）已保证：私有端点根本走不到这里。
+        _STATE_OID[0] = ""
+        return None
     _STATE_OID[0] = oid or ""
     STATE.update({
         "cfg": ctx["cfg"], "data_path": ctx["data_path"], "data": ctx["data"],
@@ -1183,6 +1120,41 @@ def _wx_secret_access_token():
     _WX_TOKEN["token"] = d["access_token"]
     _WX_TOKEN["exp"] = now + int(d.get("expires_in", 7200))
     return _WX_TOKEN["token"]
+
+
+def _wx_code2session(code):
+    """用 wx.login 的 code 换 openid（微信官方 jscode2session）。
+
+    ⚠️ 这是「公网兜底通道」下唯一可信的身份来源：前端自己编的 openid 一律不可信，
+    必须由后端持 AppSecret 向微信校验。拿不到凭证/校验失败 → 返回空串。
+
+    返回 (openid, unionid, err)。
+    """
+    code = str(code or "").strip()
+    if not code:
+        return "", "", "code 为空"
+    appid = (os.environ.get("WX_APPID") or "").strip()
+    secret = (os.environ.get("WX_SECRET") or "").strip()
+    if not (appid and secret):
+        ws = _load_wx_secret_file() or {}
+        appid = appid or str(ws.get("WX_APPID") or "").strip()
+        secret = secret or str(ws.get("WX_SECRET") or "").strip()
+    if not (appid and secret):
+        return "", "", "服务端未配置 WX_APPID / WX_SECRET，无法校验用户身份"
+    url = ("https://api.weixin.qq.com/sns/jscode2session?appid=" + urllib.parse.quote(appid)
+           + "&secret=" + urllib.parse.quote(secret)
+           + "&js_code=" + urllib.parse.quote(code) + "&grant_type=authorization_code")
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            d = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        return "", "", f"调用微信接口失败：{e}"[:160]
+    if d.get("errcode"):
+        return "", "", f"微信校验失败：{d.get('errcode')} {d.get('errmsg')}"
+    oid = str(d.get("openid") or "").strip()
+    if not oid:
+        return "", "", "微信未返回 openid"
+    return oid, str(d.get("unionid") or "").strip(), ""
 
 
 def _wx_file_download_url(fileid, env=None):
@@ -1765,6 +1737,15 @@ class Handler(BaseHTTPRequestHandler):
         p = urlparse(self.path).path
         # 先按 openid 切到该用户上下文：此后所有 STATE 读写都是他自己的库/Key/上传。
         oid, _ctx = _use_user(self)
+        # ⚠️ 隐私闸门：下列端点是「用户私有数据」，必须携带微信 openid 才可读。
+        # 匿名请求不再落到共享库，直接 401（避免读到别人的文献/API 配置）。
+        _PRIVATE_GET = ("/api/settings", "/api/models", "/api/docs", "/api/doc",
+                        "/api/task", "/api/analyze-pdf", "/api/page-image",
+                        "/api/sources", "/api/export", "/api/file", "/api/search")
+        if p in _PRIVATE_GET or p.startswith("/uploads/") or p.startswith("/data/pages/"):
+            ok, oid, _ctx = _need_identity(self)
+            if not ok:
+                return
         if p in ("/", "/index.html", "/lens"):
             # 每次请求都重读网页，改完 template + render 后刷新即可看到
             if STATE["html_path"] and os.path.exists(STATE["html_path"]):
@@ -1960,6 +1941,25 @@ class Handler(BaseHTTPRequestHandler):
         p = urlparse(self.path).path
         # 先按 openid 切到该用户上下文：此后解析/翻译/生成全部用他自己的库与 Key。
         oid, _ctx = _use_user(self)
+        # ⚠️ 隐私闸门：除「连通性测试」外，所有写操作都必须有微信 openid。
+        # 拿不到身份直接 401，绝不写入任何共享库 —— 否则后来者会看到前一个人的
+        # 文献与其 API Key（历史上正是这个漏洞）。
+        if p not in ("/api/test", "/api/wx-login"):
+            ok, oid, _ctx = _need_identity(self)
+            if not ok:
+                return
+        if p == "/api/wx-login":
+            # 用 wx.login 的 code 换取 openid（服务端持 AppSecret 校验，不可伪造）。
+            # 该端点无需预先带身份，但也**不创建任何用户上下文**。
+            req = self._read_json()
+            if req is None:
+                return
+            oid, _unionid, err = _wx_code2session(req.get("code"))
+            if not oid:
+                self._send(200, {"ok": False, "error": err or "登录失败"})
+                return
+            self._send(200, {"ok": True, "openid": oid, "scope": "openid"})
+            return
         if p == "/api/test":
             # 用临时表单里的配置做一次连通性+JSON 能力探测,绝不落盘。
             # 既支持"测已存 provider",也支持"测用户即将填的新 API"。
