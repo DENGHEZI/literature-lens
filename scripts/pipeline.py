@@ -34,7 +34,12 @@ from analyzer import Analyzer, build_meta, pick_body_blocks
 from sources import (discover_liyu_raw, discover_farmers,
                      guess_title_from_filename, enrich_from_pdf_firstpage)
 
-CONFIG = load_config()
+# ⚠️ 必须 require_provider=False：这是「模块导入时」执行的加载。
+# 云端采用「各端自行配置 Key」的架构，后端进程本身可能没有任何 provider；
+# 若此处要求 provider，任何 `from pipeline import ...` 都会当场抛 ConfigError，
+# 导致解析请求直接失败（这正是「上传→解析」在云上无法工作的原因之一）。
+# 真正的 provider 可用性由调用方（serve.py 的 _analyze_core）按需校验。
+CONFIG = load_config(require_provider=False)
 ROOT = os.path.dirname(HERE)
 OUT_DIR = CONFIG["output"]["dir"]
 # 页图落盘基准目录：默认 <repo>/data；多租户部署时由 serve.py 通过环境变量

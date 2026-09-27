@@ -679,7 +679,9 @@ def _use_user(self, req=None):
 
 
 def load(data_path, html_path=None, cfg=None):
-    cfg = cfg or load_config()
+    # require_provider=False：云端「各端自配 Key」架构下后端进程可能无 provider，
+    # 启动/兜底加载不应因此失败（Provider 可用性由 _analyze_core 按需校验）。
+    cfg = cfg or load_config(require_provider=False)
     STATE["cfg"] = cfg
     STATE["data_path"] = data_path
     STATE["data"] = json.load(open(data_path, encoding="utf-8"))
