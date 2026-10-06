@@ -41,6 +41,30 @@ from llm_client import CloudLLM, LLMError, _norm_protocol
 from analyzer import Analyzer
 from web_egress import apply_proxy, web_search, translation_confidence
 
+# ---------------- v3 安全/并发栈：Env 配置 + SQLite + Key 保险库 ----------------
+import config as server_config          # 服务器级配置（env 驱动）
+import storage as db                    # SQLite(WAL)：文献/配置/任务/蜜罐
+import keyvault                         # 用户 Key 加密存储 + 蜜罐检测
+db.init_db()
+
+# 全局 LLM 并发闸：所有解析/翻译路径的统一漏斗（防打爆上游限频）
+LLM_SEM = threading.BoundedSemaphore(server_config.LLM_CONCURRENCY)
+
+# 每用户固定窗口限流（内存版；多实例时每实例独立计数，够用且零开销）
+_RATE = {}                               # oid -> [window_start, count]
+_RATE_LOCK = threading.Lock()
+
+def _rate_ok(oid):
+    lim = server_config.RATE_LIMIT_PER_MIN
+    now = time.time()
+    with _RATE_LOCK:
+        w = _RATE.get(oid)
+        if not w or now - w[0] >= 60:
+            _RATE[oid] = [now, 1]
+            return True
+        w[1] += 1
+        return w[1] <= lim
+
 STATE = {"data": None, "llm": None, "az": None, "html": "",
          "doc_index": {}, "html_path": "", "data_path": "", "cfg": {},
          "upload_dir": ""}
@@ -398,6 +422,9 @@ def _build_temporary_llm(req):
             proto = (tr.get("protocol") or "").strip() or None
     if not (base and model and key):
         raise ValueError("缺少 base_url/model/api_key 之一")
+    if keyvault.check_honeypot(key, openid=_current_oid()):
+        # 🍯 命中蜜罐：告警入库，并给攻击者一个「合理」的失败
+        raise ValueError("Key 无效或已过期")
     provider = {
         "id": "tmp-probe", "name": "临时探测", "protocol": proto or "openai",
         "base_url": base, "api_key": key, "model": model, "enabled": True,
@@ -627,12 +654,30 @@ def _build_ctx(oid):
     paths = _ctx_paths(oid)
     _ensure_user_data(paths)
     data_path = paths["data"]
-    cfg = load_config(extra=[paths["config"]], require_provider=False,
-                      skip_global_user=True)
+    # —— v3：用户 Key 配置改走「加密保险库」（SQLite blob，主密钥在 env）。
+    # 明文 config.user.json 只作为一次性迁移来源，迁移后不再新增明文。
+    cfg = load_config(require_provider=False, skip_global_user=True)
+    vault = keyvault.load_user_config(oid)
+    if vault:
+        cfg["providers"] = vault.get("providers") or cfg.get("providers") or []
+        cfg["active_provider"] = vault.get("active_provider") or cfg.get("active_provider")
+    elif oid and os.path.isfile(paths["config"]):
+        try:
+            legacy = json.load(open(paths["config"], encoding="utf-8"))
+            keyvault.save_user_config(oid, {
+                "active_provider": legacy.get("active_provider"),
+                "providers": legacy.get("providers") or []})
+            cfg["providers"] = legacy.get("providers") or []
+            cfg["active_provider"] = legacy.get("active_provider") or cfg.get("active_provider")
+            print(f"[keyvault] 用户 {oid[:8]}*** 明文配置已迁移为加密存储", flush=True)
+        except Exception:
+            pass
     up_cfg = dict(cfg.get("uploads") or {})
     up_cfg["dir"] = paths["upload"]        # 强制指向该用户自己的上传目录
     cfg["uploads"] = up_cfg
-    data = json.load(open(data_path, encoding="utf-8"))
+    # —— v3：文献库改读 SQLite（首次见到旧 JSON 自动迁移，幂等）
+    db.migrate_user_json(oid, data_path)
+    data = {"docs": db.list_docs(oid)}
     ctx = {
         "oid": oid,
         "paths": paths,
@@ -753,7 +798,16 @@ def _save_tasks():
 
 
 def _load_tasks():
-    """启动时从磁盘恢复任务表（不重启任何任务，只把记录读回内存）。"""
+    """启动时恢复任务表：优先 SQLite（跨实例共享），旧 tasks.json 兜底。"""
+    try:
+        d = db.load_all_tasks()
+        if d:
+            with _TASKS_LOCK:
+                TASKS.update(d)
+            print(f"[storage] 从 SQLite 恢复 {len(d)} 条任务记录", flush=True)
+            return
+    except Exception:
+        pass
     try:
         p = _tasks_file()
         if not os.path.exists(p):
@@ -796,6 +850,13 @@ def _heal_tasks():
 def _set_task(task_id, **kw):
     with _TASKS_LOCK:
         TASKS.setdefault(task_id, {}).update(kw)
+        snap = dict(TASKS[task_id])
+    # v3：任务同时写 SQLite —— 多实例部署时任何实例都能读到任务状态
+    try:
+        db.upsert_task(task_id, snap.get("uid") or "", snap.get("status") or "queued",
+                       snap.get("stage") or "", snap)
+    except Exception:
+        pass
     _save_tasks()
 
 
@@ -813,8 +874,8 @@ def _current_oid():
     return _STATE_OID[0]
 
 
-def _analyze_core(task_id, upload_id, filename, llm_cfg=None, oid="",
-                  timeout=None, max_pages=None):
+def _analyze_core_impl(task_id, upload_id, filename, llm_cfg=None, oid="",
+                       timeout=None, max_pages=None):
     """解析上传的 PDF：抽取 → 术语 → 批量翻译 → 创新点分析 → 写入文献库。
 
     返回生成好的 doc（含译文/创新点）；出错或未配置模型时返回 None，
@@ -885,6 +946,10 @@ def _analyze_core(task_id, upload_id, filename, llm_cfg=None, oid="",
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(raw, f, ensure_ascii=False, indent=1)
             os.replace(tmp, ctx["data_path"])
+        try:
+            db.upsert_doc(oid, doc)            # v3：文献入 SQLite（多实例可见）
+        except Exception as _e:
+            print("[storage] doc 入库失败:", _e, flush=True)
         ctx["doc_index"][doc["id"]] = doc
         ctx["data"]["docs"] = [d for d in (ctx["data"].get("docs") or [])
                                if d.get("id") != doc["id"]]
@@ -1020,6 +1085,18 @@ def _reanalyze_worker(task_id, doc_id, oid=""):
         if "401" in msg or "api key" in low or "unauthorized" in low or "authentication" in low:
             msg += " ｜ 提示：请先到「设置 → API」粘贴有效 Key 并测试连接"
         set_task(status="error", stage="解析失败", error=msg)
+
+
+def _analyze_core(task_id, upload_id, filename, llm_cfg=None, oid="",
+                  timeout=None, max_pages=None):
+    """v3：全局 LLM 并发闸（LENS_LLM_CONCURRENCY，默认 8）。
+
+    所有解析/翻译路径（后台线程、inline 同步、translate-sync）统一经过这里，
+    防止单实例同时发起过多 LLM 请求打爆上游限频。
+    """
+    with LLM_SEM:
+        return _analyze_core_impl(task_id, upload_id, filename, llm_cfg, oid,
+                                  timeout=timeout, max_pages=max_pages)
 
 
 # ---------------- 微信云存储取文件（callContainer 下 PDF 走对象存储） ----------------
@@ -1654,8 +1731,13 @@ class Handler(BaseHTTPRequestHandler):
             _want_analyze = bool(req.get("with_analyze") or req.get("do_analyze")
                                  or req.get("inline"))
             if _want_analyze:
+                _llm_payload = req.get("llm") or None
+                if _llm_payload and keyvault.check_honeypot(
+                        (_llm_payload or {}).get("api_key"), openid=oid):
+                    self._send(400, {"ok": False, "error": "Key 无效（已记录）"})
+                    return
                 self._send(200, self._analyze_inline(
-                    meta["id"], req.get("filename") or "", req.get("llm") or None))
+                    meta["id"], req.get("filename") or "", _llm_payload))
                 return
             self._send(200, {"ok": True, "upload": meta})
 
@@ -1741,7 +1823,8 @@ class Handler(BaseHTTPRequestHandler):
         # 匿名请求不再落到共享库，直接 401（避免读到别人的文献/API 配置）。
         _PRIVATE_GET = ("/api/settings", "/api/models", "/api/docs", "/api/doc",
                         "/api/task", "/api/analyze-pdf", "/api/page-image",
-                        "/api/sources", "/api/export", "/api/file", "/api/search")
+                        "/api/sources", "/api/export", "/api/file", "/api/search",
+                        "/api/keys")
         if p in _PRIVATE_GET or p.startswith("/uploads/") or p.startswith("/data/pages/"):
             ok, oid, _ctx = _need_identity(self)
             if not ok:
@@ -1775,6 +1858,23 @@ class Handler(BaseHTTPRequestHandler):
                 "isolated": bool(oid),
                 "providers": llm.list_providers() if llm else [],
             })
+        elif p == "/api/keys":
+            # v3：Key 云端托管查询 —— 只回元数据 + 脱敏 Key，绝不回明文。
+            cfg = STATE.get("cfg") or {}
+            items = []
+            for pr in (cfg.get("providers") or []):
+                items.append({"id": pr.get("id"), "name": pr.get("name"),
+                              "model": pr.get("model"), "protocol": pr.get("protocol"),
+                              "api_key_masked": keyvault.mask_key(pr.get("api_key"))})
+            self._send(200, {"ok": True, "active": cfg.get("active_provider"),
+                             "providers": items, "vault": "sqlite-encrypted"})
+        elif p == "/api/admin/config":
+            # 🍯 蜜罐诱饵端点：返回「看起来值钱」的内部配置，全部是 HONEYPOT 假 Key。
+            _ip = self.client_address[0] if getattr(self, "client_address", None) else ""
+            server_config.honeypot_hit(kind="decoy_endpoint", ip=_ip, openid=oid,
+                                       detail="GET /api/admin/config")
+            self._send(200, {"ok": True, "instance": server_config.INSTANCE_ID,
+                             **server_config.DECOY_CONFIG})
         elif p == "/api/models":
             self._send(200, {"ok": True,
                              "active": STATE["llm"].active if STATE["llm"] else "",
@@ -1947,6 +2047,9 @@ class Handler(BaseHTTPRequestHandler):
         if p not in ("/api/test", "/api/wx-login"):
             ok, oid, _ctx = _need_identity(self)
             if not ok:
+                return
+            if not _rate_ok(oid):               # v3：每用户写请求限流（防刷/防爆破）
+                self._send(429, {"ok": False, "error": "请求过于频繁，请稍后再试"})
                 return
         if p == "/api/wx-login":
             # 用 wx.login 的 code 换取 openid（服务端持 AppSecret 校验，不可伪造）。
@@ -2156,6 +2259,10 @@ class Handler(BaseHTTPRequestHandler):
                       created_at=int(time.time()))
             # 允许前端（手机）随请求带来临时 LLM 配置（用手机已配的 Key），后端无需任何 AI 配置
             llm_cfg = req.get("llm") or None
+            if llm_cfg and keyvault.check_honeypot((llm_cfg or {}).get("api_key"),
+                                                   openid=oid):
+                self._send(400, {"ok": False, "error": "Key 无效（已记录）"})
+                return
             threading.Thread(
                 target=_analyze_worker,
                 args=(task_id, upload_id, filename, llm_cfg, oid),
@@ -2175,6 +2282,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             filename = (req.get("filename") or "upload.pdf").strip()
             llm_cfg = req.get("llm") or None
+            if llm_cfg and keyvault.check_honeypot((llm_cfg or {}).get("api_key"),
+                                                   openid=oid):
+                self._send(400, {"ok": False, "error": "Key 无效（已记录）"})
+                return
             upload_id = (req.get("upload_id") or "").strip()
             file_data = req.get("file_data") or None
             # 可选：直接带 base64 文件，本请求内落盘（与上传共用目录，页图找回一致）
@@ -2251,9 +2362,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(400, {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
                 return
-            cfg_path = (_ctx.get("paths") or {}).get("config")
-            save_user_config({"active_provider": active, "providers": providers},
-                             path=cfg_path)
+            # v3：蜜罐检测 —— 提交的 Key 命中假 Key 立即告警并拒绝
+            _ip = self.client_address[0] if getattr(self, "client_address", None) else ""
+            if keyvault.scan_config_honeypot({"providers": providers}, ip=_ip, openid=oid):
+                self._send(400, {"ok": False, "error": "Key 无效（安全策略已记录此次提交）"})
+                return
+            # v3：Key 加密入库（SQLite blob），不再写明文 config.user.json
+            keyvault.save_user_config(oid, {"active_provider": active,
+                                            "providers": providers})
             try:
                 _reload_ctx(_ctx)                 # 只重载该用户上下文，不影响他人
                 _ctx_state(oid)

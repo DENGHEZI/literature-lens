@@ -34,3 +34,9 @@ scripts/*_out.json
 _test_*.py
 _test*.py
 _*.log
+
+# ---------------- v3：数据库 / 主密钥（绝不入库） ----------------
+data/master.key
+*.db
+*.db-wal
+*.db-shm
