@@ -197,18 +197,18 @@ export const CLOUD_SERVICE = 'literature-lens'           // 部署后端后获�
 
 ## v3 安全升级：环境变量配置（必读）
 
-v3 起，用户 API Key 加密存入 SQLite（，WAL 模式），磁盘上不再有明文 Key。
+v3 起，用户 API Key 加密存入 SQLite（`data/lens.db`，WAL 模式），磁盘上不再有明文 Key。
 **必须在云托管控制台配置以下环境变量**（服务 → 版本配置 → 环境变量）：
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
-|  | ⭐ 必须 | 32+ 位随机 hex（本机 5aee59a8ae5516c4cc35a5888c58b1c5f01047b56b98380dd5fc43741e49b781 生成）。**用户 Key 的加密主密钥**；丢失/更换将导致已存 Key 无法解密（需用户重填） |
-|  | 强烈建议 | 指向 CFS 挂载点（如 ），SQLite 与上传文件都落在持久卷 |
-|  | 可选 | LLM 并发上限，默认 8 |
-|  | 可选 | 每用户每分钟写请求上限，默认 120 |
-|  | 可选 | 多实例时区分日志来源 |
-|  /  /  | 可选 | 仅公网兜底通道的 code2Session 需要 |
+| `LENS_MASTER_KEY` | ⭐ 必须 | 32+ 位随机 hex（本机 `openssl rand -hex 32` 生成）。**用户 Key 的加密主密钥**；丢失/更换将导致已存 Key 无法解密（需用户重填） |
+| `LENS_DATA_DIR` | 强烈建议 | 指向 CFS 挂载点（如 `/data`），SQLite 与上传文件都落在持久卷 |
+| `LENS_LLM_CONCURRENCY` | 可选 | LLM 并发上限，默认 8 |
+| `LENS_RATE_LIMIT` | 可选 | 每用户每分钟写请求上限，默认 120 |
+| `LENS_INSTANCE_ID` | 可选 | 多实例时区分日志来源 |
+| `WX_APPID` / `WX_SECRET` / `WX_ENV` | 可选 | 仅公网兜底通道的 code2Session 需要 |
 
 多实例分布部署：任务表/文献库/用户配置全部入库 + 数据目录挂 CFS 后，实例可以横向扩容，
 任意实例都能处理任意用户的请求（不再有「上传在 A、轮询打到 B」的错位问题）。
-蜜罐：内置假 Key 与诱饵端点 ，命中即入库告警（ 表）。
+蜜罐：内置假 Key 与诱饵端点 `/api/admin/config`，命中即入库告警（`honeypot` 表）。
