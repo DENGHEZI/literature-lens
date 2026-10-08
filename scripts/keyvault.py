@@ -21,6 +21,15 @@ import storage as _st
 _MAGIC = b"LV1"
 _NONCE_LEN = 16
 
+# 匿名/公网域名访问（无微信 openid）时使用的稳定哨兵身份。
+# storage 的 user_config 表对空 oid 直接返回 None/False，因此必须用固定哨兵串，
+# 否则「公网网页保存 Key」会静默失败（这正是「云端收不到 Key」的链路之一）。
+ANON = "__lens_anon__"
+
+
+def _norm_oid(oid) -> str:
+    return (oid or "").strip() or ANON
+
 
 # ---------------- 流加密原语 ----------------
 def _keystream(key: bytes, nonce: bytes, n: int) -> bytes:
@@ -41,34 +50,57 @@ def encrypt(plaintext: bytes) -> bytes:
 
 
 def decrypt(blob: bytes):
-    """解密；完整性校验失败返回 None（绝不返回被篡改的数据）。"""
+    """解密；完整性校验失败返回 None（绝不返回被篡改的数据）。
+
+    依次尝试所有主密钥（_cfg.MASTER_KEYS），以支持主密钥轮换：
+    旧密钥期间加密的 blob，在更换新密钥后依然能解密。
+    """
     try:
         if not blob or blob[:3] != _MAGIC or len(blob) < 3 + _NONCE_LEN + 32:
             return None
         nonce = blob[3:3 + _NONCE_LEN]
         ct = blob[3 + _NONCE_LEN:-32]
         tag = blob[-32:]
-        want = hmac.new(_cfg.MASTER_KEY, _MAGIC + nonce + ct, hashlib.sha256).digest()
-        if not hmac.compare_digest(tag, want):
-            return None
-        ks = _keystream(_cfg.MASTER_KEY, nonce, len(ct))
-        return bytes(a ^ b for a, b in zip(ct, ks))
+        for key in _cfg.MASTER_KEYS:
+            want = hmac.new(key, _MAGIC + nonce + ct, hashlib.sha256).digest()
+            if hmac.compare_digest(tag, want):
+                ks = _keystream(key, nonce, len(ct))
+                return bytes(a ^ b for a, b in zip(ct, ks))
+        return None
     except Exception:
         return None
 
 
 # ---------------- 用户配置的存取 ----------------
 def save_user_config(oid, cfg: dict) -> bool:
-    """把某用户的完整 provider 配置加密入库。内存/DB/日志全程无明文。"""
-    if not oid or not isinstance(cfg, dict):
+    """把某用户的完整 provider 配置加密入库。
+
+    返回 True 仅当：写入成功 **且** 立即回读能正常解密 —— 否则视为“假保存”
+    （典型：主密钥不匹配），绝不向调用方谎报成功（过去这会导致“云端收不到 Key”）。
+    内存/DB/日志全程无明文。
+    """
+    if not isinstance(cfg, dict):
         return False
-    blob = encrypt(json.dumps(cfg, ensure_ascii=False).encode("utf-8"))
+    oid = _norm_oid(oid)
+    try:
+        blob = encrypt(json.dumps(cfg, ensure_ascii=False).encode("utf-8"))
+    except Exception:
+        return False
     _st.ensure_user(oid)
-    return _st.put_user_config_blob(oid, blob)
+    if not _st.put_user_config_blob(oid, blob):
+        return False
+    # 回读校验：确认落盘后能被正常解密
+    raw = load_user_config(oid)
+    if raw is None:
+        print(f"[keyvault][warn] 用户 {oid[:8]}*** 的 Key 已写入但回读解密失败"
+              f"（主密钥不匹配？），保存未真正生效", flush=True)
+        return False
+    return True
 
 
 def load_user_config(oid):
     """取出并解密某用户的 provider 配置；无/损坏 → None。"""
+    oid = _norm_oid(oid)
     blob = _st.get_user_config_blob(oid)
     if not blob:
         return None

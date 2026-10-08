@@ -2044,7 +2044,7 @@ class Handler(BaseHTTPRequestHandler):
         # ⚠️ 隐私闸门：除「连通性测试」外，所有写操作都必须有微信 openid。
         # 拿不到身份直接 401，绝不写入任何共享库 —— 否则后来者会看到前一个人的
         # 文献与其 API Key（历史上正是这个漏洞）。
-        if p not in ("/api/test", "/api/wx-login"):
+        if p not in ("/api/test", "/api/wx-login", "/api/settings"):
             ok, oid, _ctx = _need_identity(self)
             if not ok:
                 return
@@ -2368,10 +2368,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"ok": False, "error": "Key 无效（安全策略已记录此次提交）"})
                 return
             # v3：Key 加密入库（SQLite blob），不再写明文 config.user.json
-            keyvault.save_user_config(oid, {"active_provider": active,
-                                            "providers": providers})
+            # 保存会做「写入即回读」校验：主密钥不匹配等情况会返回 False，
+            # 此时必须如实报错，绝不能谎报 ok:True（否则用户看到“已保存”却用不了）。
+            if not keyvault.save_user_config(oid, {"active_provider": active,
+                                                   "providers": providers}):
+                self._send(500, {"ok": False, "error": (
+                    "Key 已写入但回读校验失败：主密钥不匹配或存储不可用。"
+                    "请确认云托管已配置 LENS_MASTER_KEY（且与历史一致），"
+                    "或删除 /data/lens.db 后重试。")})
+                return
             try:
-                _reload_ctx(_ctx)                 # 只重载该用户上下文，不影响他人
+                # 公网匿名（oid 为空）时 _ctx 为 None，需先按公共上下文重建再热重载
+                _ctx_local = _ctx if _ctx is not None else _build_ctx("")
+                _reload_ctx(_ctx_local)           # 只重载该用户/公共上下文，不影响他人
                 _ctx_state(oid)
             except Exception as e:
                 self._send(500, {"ok": False, "error": f"配置保存了,但重新载入失败:{e}"[:220]})

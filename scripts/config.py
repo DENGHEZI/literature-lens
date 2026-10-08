@@ -37,7 +37,10 @@ RATE_LIMIT_PER_MIN = max(10, int(os.environ.get("LENS_RATE_LIMIT") or 120))
 DB_BUSY_TIMEOUT_MS = int(os.environ.get("LENS_DB_BUSY_TIMEOUT_MS") or 5000)
 
 # ---------------- 主密钥（加密用户 Key 用） ----------------
-_MASTER = (os.environ.get("LENS_MASTER_KEY") or "").strip()
+# 支持「逗号分隔的多密钥」：第一个用于「加密」，全部用于「解密尝试」。
+# 这样可在不丢失历史数据的前提下平滑轮换主密钥（旧密钥放进第 2、3 个位置）。
+_MASTER_RAW = (os.environ.get("LENS_MASTER_KEY") or "").strip()
+_MASTER_KEYS = [k for k in _MASTER_RAW.split(",") if k and len(k) >= 8]
 
 
 def _autogen_master():
@@ -58,16 +61,31 @@ def _autogen_master():
             os.chmod(MASTER_KEY_FILE, 0o600)
         except Exception:
             pass
+        print(f"[config][warn] 已自动生成主密钥并落盘 {MASTER_KEY_FILE}（仅本地开发用）",
+              flush=True)
     except Exception:
         pass
     return k
 
 
-if not _MASTER:
-    _MASTER = _autogen_master()
-    print(f"[config][warn] 未设置 LENS_MASTER_KEY，已自动生成并落盘 {MASTER_KEY_FILE}。"
-          f"生产环境请在云托管控制台配置环境变量，避免依赖本机文件。")
-MASTER_KEY = _MASTER.encode("utf-8")
+if not _MASTER_KEYS:
+    _MASTER_KEYS = [_autogen_master()]
+    # ⚠️ 这是「云端 Key 过一段时间会掉 / 收不到 Key」的头号根因：
+    # 云托管每次重启、扩容、灰度都会起一个新容器，若未显式配置 LENS_MASTER_KEY，
+    # 这里会自动重新生成一把主密钥 → 历史加密的 Key 全部解密失败 → 表现为“Key 掉了”。
+    # 云托管控制台的「环境变量」是跨重启稳定的，设一次即可永久解决。
+    print(
+        "[config][CRITICAL] 未设置 LENS_MASTER_KEY！\n"
+        "  → 云托管每次重启/扩容都会重新生成主密钥，导致【已保存的用户 Key 无法解密 = 自动“掉线”】。\n"
+        "  → 这正是「Key 过一段时间会掉 / 云端收不到 Key」的根因。\n"
+        "  → 请在云托管控制台「环境变量」里添加 LENS_MASTER_KEY\n"
+        "    （值用 `openssl rand -hex 32` 生成，一次性设置后即永久稳定，不受重启/扩容影响），\n"
+        "    改完重建/重启服务即可。本地开发可忽略此提示。",
+        flush=True,
+    )
+
+MASTER_KEY = _MASTER_KEYS[0].encode("utf-8")          # 加密用主密钥（首个）
+MASTER_KEYS = [k.encode("utf-8") for k in _MASTER_KEYS]  # 解密候选（支持轮换）
 
 # ---------------- 微信凭证（仅环境变量） ----------------
 WX_APPID = (os.environ.get("WX_APPID") or "").strip()
