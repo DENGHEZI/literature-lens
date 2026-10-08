@@ -1821,7 +1821,10 @@ class Handler(BaseHTTPRequestHandler):
         oid, _ctx = _use_user(self)
         # ⚠️ 隐私闸门：下列端点是「用户私有数据」，必须携带微信 openid 才可读。
         # 匿名请求不再落到共享库，直接 401（避免读到别人的文献/API 配置）。
-        _PRIVATE_GET = ("/api/settings", "/api/models", "/api/docs", "/api/doc",
+        # /api/settings 已从私密 GET 列表移除：网页端需在「公网域名/无 openid」下
+        # 也能加载/保存自己的 API Key（单租户自托管场景）。该端点绝不回传明文 Key，
+        # 仅返回脱敏后的 provider 列表与「是否已配置」状态，隐私风险可控。
+        _PRIVATE_GET = ("/api/models", "/api/docs", "/api/doc",
                         "/api/task", "/api/analyze-pdf", "/api/page-image",
                         "/api/sources", "/api/export", "/api/file", "/api/search",
                         "/api/keys")
@@ -1881,17 +1884,27 @@ class Handler(BaseHTTPRequestHandler):
                              "providers": STATE["llm"].list_providers() if STATE["llm"] else []})
         elif p == "/api/settings":
             # 只返回可展示的配置,绝不把 API key 回传到浏览器。
-            # 每个用户看到的是自己的 provider（来自 users/<oid>/config.user.json），互不可见。
-            ps = STATE["llm"].list_providers() if STATE["llm"] else []
-            act_id = STATE["llm"].active if STATE["llm"] else ""
-            active = next((p for p in ps if p["id"] == act_id), None)
-            cfg_path = (_ctx.get("paths") or {}).get("config") \
-                or os.path.join(os.path.dirname(HERE), "config.user.json")
+            # v3：用户 Key 存于加密保险库（SQLite），故「是否已配置」以保险库为准，
+            # 而非 legacy 的 config.user.json 文件存在性（该文件 v3 已不再写入）。
+            vault_cfg = keyvault.load_user_config(oid) or {}
+            if vault_cfg.get("providers"):
+                ps = [{
+                    "id": pr.get("id"), "name": pr.get("name"),
+                    "base_url": pr.get("base_url"), "model": pr.get("model"),
+                    "protocol": pr.get("protocol", "openai"),
+                    "enabled": pr.get("enabled", True),
+                    "api_key_masked": keyvault.mask_key(pr.get("api_key") or ""),
+                } for pr in vault_cfg.get("providers") if isinstance(pr, dict)]
+                act_id = vault_cfg.get("active_provider") or (ps[0]["id"] if ps else "")
+            else:
+                ps = STATE["llm"].list_providers() if STATE["llm"] else []
+                act_id = STATE["llm"].active if STATE["llm"] else ""
+            active = next((x for x in ps if x["id"] == act_id), None)
             self._send(200, {
                 "ok": True,
                 "active": act_id,
                 "providers": ps,
-                "has_user_config": os.path.isfile(cfg_path),
+                "has_user_config": bool(vault_cfg.get("providers")),
                 "uid": oid,                      # 前端可据此确认「已按用户隔离」
                 "active_summary": {
                     "id": active["id"], "name": active["name"],

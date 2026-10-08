@@ -716,7 +716,7 @@ body.eye ::-webkit-scrollbar-thumb{background:#d8cdb2}
   <div class="modal-card">
     <div class="modal-head"><h3>我的 API 设置</h3><p>填一次 Key，翻译 · AI 助手 · 思维导图全部可用</p><button class="modal-x" id="apiClose">✕</button></div>
     <div class="modal-body">
-      <div class="api-note">密钥仅保存到本机 <b>config.user.json</b>，不进入网页、不上传第三方。选预设 → 粘 Key → 测试 → 保存，四步完成。</div>
+      <div class="api-note">密钥通过 HTTPS <b>上传到后端服务端</b>，加密后存入保险库（不在网页明文、不落本地文件）。选预设 → 粘 Key → 测试 → 保存，四步完成；保存后即在<b>云端生效并跨设备可用</b>。</div>
       <div class="svc-row" id="svcRow">
         <span class="lb">服务地址</span>
         <input id="apiBaseInput" placeholder="http://127.0.0.1:8877" spellcheck="false">
